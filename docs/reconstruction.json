@@ -1,0 +1,241 @@
+{
+  "source_filename": "Emotion_detection_llm_(1)(3).ipynb",
+  "source_format": "plain-text notebook export, not notebook JSON",
+  "source_sha256": "e77d6817097c2817718943d1c12651c63f9c519112a71f64da281ce6e23ca56f",
+  "steps_reconstructed": [
+    {
+      "step": 1,
+      "title": "Install dependencies",
+      "source_lines": 2
+    },
+    {
+      "step": 2,
+      "title": "Imports",
+      "source_lines": 36
+    },
+    {
+      "step": 3,
+      "title": "Configuration",
+      "source_lines": 26
+    },
+    {
+      "step": 4,
+      "title": "Custom PyTorch Dataset class",
+      "source_lines": 13
+    },
+    {
+      "step": 5,
+      "title": "Shared helper functions",
+      "source_lines": 55
+    },
+    {
+      "step": 6,
+      "title": "Load Emotion dataset (6 classes)",
+      "source_lines": 11
+    },
+    {
+      "step": 7,
+      "title": "Load GoEmotions dataset (28 classes)",
+      "source_lines": 22
+    },
+    {
+      "step": 8,
+      "title": "Basic dataset statistics",
+      "source_lines": 14
+    },
+    {
+      "step": 9,
+      "title": "Label distribution across Train / Val / Test splits - Emotion dataset",
+      "source_lines": 25
+    },
+    {
+      "step": 10,
+      "title": "Class imbalance analysis",
+      "source_lines": 31
+    },
+    {
+      "step": 11,
+      "title": "Text length analysis - Emotion dataset",
+      "source_lines": 39
+    },
+    {
+      "step": 12,
+      "title": "Word count comparison - Emotion vs GoEmotions",
+      "source_lines": 28
+    },
+    {
+      "step": 13,
+      "title": "GoEmotions full label distribution (all 28 classes)",
+      "source_lines": 18
+    },
+    {
+      "step": 14,
+      "title": "Top 15 most frequent words per emotion class - Emotion dataset",
+      "source_lines": 37
+    },
+    {
+      "step": 15,
+      "title": "Noise analysis - identify noisy patterns in both datasets",
+      "source_lines": 21
+    },
+    {
+      "step": 16,
+      "title": "Sample texts per emotion - qualitative inspection",
+      "source_lines": 9
+    },
+    {
+      "step": 17,
+      "title": "Text cleaning function (lowercase version - for uncased models)",
+      "source_lines": 36
+    },
+    {
+      "step": 18,
+      "title": "Apply cleaning to all splits",
+      "source_lines": 20
+    },
+    {
+      "step": 19,
+      "title": "Remove very short texts after cleaning (min 3 chars)",
+      "source_lines": 15
+    },
+    {
+      "step": 20,
+      "title": "Remove duplicate texts within each split",
+      "source_lines": 15
+    },
+    {
+      "step": 21,
+      "title": "Post-cleaning word count and effect visualization",
+      "source_lines": 29
+    },
+    {
+      "step": 22,
+      "title": "Prepare final label lists (from cleaned dataframes)",
+      "source_lines": 13
+    },
+    {
+      "step": 23,
+      "title": "Load all tokenizers",
+      "source_lines": 14
+    },
+    {
+      "step": 24,
+      "title": "Actual token length distribution using BERT tokenizer (sub-word level)",
+      "source_lines": 25
+    },
+    {
+      "step": 25,
+      "title": "Tokenize with BERT and train",
+      "source_lines": 21
+    },
+    {
+      "step": 26,
+      "title": "Evaluate BERT",
+      "source_lines": 16
+    },
+    {
+      "step": 27,
+      "title": "Tokenize with RoBERTa and train",
+      "source_lines": 20
+    },
+    {
+      "step": 28,
+      "title": "Evaluate RoBERTa",
+      "source_lines": 5
+    },
+    {
+      "step": 29,
+      "title": "Tokenize with DistilBERT and train",
+      "source_lines": 20
+    },
+    {
+      "step": 30,
+      "title": "Evaluate DistilBERT",
+      "source_lines": 5
+    },
+    {
+      "step": 31,
+      "title": "Tokenize with ALBERT and train",
+      "source_lines": 20
+    },
+    {
+      "step": 32,
+      "title": "Evaluate ALBERT",
+      "source_lines": 5
+    },
+    {
+      "step": 33,
+      "title": "Tokenize with XLNet and train",
+      "source_lines": 21
+    },
+    {
+      "step": 34,
+      "title": "Evaluate XLNet",
+      "source_lines": 5
+    },
+    {
+      "step": 35,
+      "title": "Model comparison table",
+      "source_lines": 13
+    },
+    {
+      "step": 36,
+      "title": "Comparison bar charts",
+      "source_lines": 20
+    },
+    {
+      "step": 37,
+      "title": "All confusion matrices",
+      "source_lines": 26
+    },
+    {
+      "step": 38,
+      "title": "Error analysis - top misclassification pairs per model",
+      "source_lines": 16
+    },
+    {
+      "step": 39,
+      "title": "Tokenize GoEmotions and train BERT (best performer from Section 7)",
+      "source_lines": 20
+    },
+    {
+      "step": 40,
+      "title": "Evaluate BERT on GoEmotions",
+      "source_lines": 4
+    },
+    {
+      "step": 41,
+      "title": "GoEmotions confusion matrix (top 10 classes for readability)",
+      "source_lines": 18
+    },
+    {
+      "step": 42,
+      "title": "Compare basic (6 classes) vs fine-grained (28 classes) performance",
+      "source_lines": 39
+    },
+    {
+      "step": 43,
+      "title": "Predict on custom input texts",
+      "source_lines": 30
+    },
+    {
+      "step": 44,
+      "title": "Save all trained models and tokenizers",
+      "source_lines": 21
+    },
+    {
+      "step": 45,
+      "title": "Final summary",
+      "source_lines": 33
+    }
+  ],
+  "changes": [
+    "Separated code from recorded output",
+    "Replaced notebook pip magic with setup instructions",
+    "Added repository path setup and missing-file check",
+    "Routed six input CSVs to data/",
+    "Routed new run outputs to outputs/",
+    "Cleared notebook outputs"
+  ],
+  "verification": "Python syntax and notebook structure only; GPU training not rerun"
+}

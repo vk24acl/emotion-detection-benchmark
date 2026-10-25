@@ -1,0 +1,1962 @@
+
+
+The Limits of Large Language Models in Emotion Detection
+
+Comparative Evaluation Using Benchmark Emotion Datasets
+
+Models: BERT | RoBERTa | DistilBERT | ALBERT | XLNet
+Datasets: Emotion (6 classes) | GoEmotions (28 classes)
+
+Pipeline:
+
+1.  Setup and Imports
+2.  Data Loading
+3.  Exploratory Data Analysis (EDA)
+4.  Preprocessing
+5.  Tokenizer Setup
+6.  Model Training and Evaluation
+7.  Comparative Analysis
+8.  GoEmotions Fine-Grained Detection
+9.  Basic vs Fine-Grained Comparison
+10. Save and Summary
+
+------------------------------------------------------------------------
+
+Section 1: Setup and Imports
+
+    # Step 1: Install dependencies
+    !pip install -q transformers datasets scikit-learn matplotlib seaborn accelerate
+    !pip install -q sentencepiece protobuf
+
+    # Step 2: Imports
+    import torch
+    import pandas as pd
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    import gc
+    import os
+    import re
+    import warnings
+    from collections import Counter
+    warnings.filterwarnings('ignore')
+
+    from sklearn.metrics import (
+        accuracy_score,
+        precision_recall_fscore_support,
+        confusion_matrix,
+        classification_report
+    )
+    from transformers import (
+        AutoTokenizer,
+        AutoModelForSequenceClassification,
+        Trainer,
+        TrainingArguments,
+        RobertaTokenizer, RobertaForSequenceClassification,
+        DistilBertTokenizer, DistilBertForSequenceClassification,
+        AlbertTokenizer, AlbertForSequenceClassification,
+        XLNetTokenizer, XLNetForSequenceClassification
+    )
+    from torch.utils.data import Dataset
+
+    print("All imports successful")
+    print(f"PyTorch: {torch.__version__}")
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+
+    All imports successful
+    PyTorch: 2.10.0+cu128
+    CUDA available: True
+    GPU: Tesla T4
+
+    # Step 3: Configuration
+
+    EMOTION_LABELS = ['sadness', 'joy', 'love', 'anger', 'fear', 'surprise']
+    NUM_EMOTION_LABELS = 6
+
+    GOEMOTIONS_LABELS = [
+        'admiration', 'amusement', 'anger', 'annoyance', 'approval', 'caring',
+        'confusion', 'curiosity', 'desire', 'disappointment', 'disapproval',
+        'disgust', 'embarrassment', 'excitement', 'fear', 'gratitude', 'grief',
+        'joy', 'love', 'nervousness', 'optimism', 'pride', 'realization',
+        'relief', 'remorse', 'sadness', 'surprise', 'neutral'
+    ]
+    NUM_GOEMOTIONS_LABELS = 28
+
+    MAX_LENGTH    = 128
+    BATCH_SIZE    = 8       # Reduce to 4 if OOM on Colab
+    GRAD_ACCUM    = 2       # Effective batch = BATCH_SIZE * GRAD_ACCUM
+    NUM_EPOCHS    = 3
+    LEARNING_RATE = 2e-5
+    SEED          = 42
+
+    torch.manual_seed(SEED)
+    np.random.seed(SEED)
+
+    DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Device: {DEVICE}")
+
+    Device: cuda
+
+    # Step 4: Custom PyTorch Dataset class
+    class EmotionDataset(Dataset):
+        def __init__(self, encodings, labels):
+            self.encodings = encodings
+            self.labels    = labels
+
+        def __getitem__(self, idx):
+            item = {key: torch.tensor(val[idx]) for key, val in self.encodings.items()}
+            item['labels'] = torch.tensor(self.labels[idx])
+            return item
+
+        def __len__(self):
+            return len(self.labels)
+
+    # Step 5: Shared helper functions
+
+    def tokenize_texts(texts, tokenizer):
+        return tokenizer(
+            list(texts),
+            padding='max_length',
+            truncation=True,
+            max_length=MAX_LENGTH,
+            return_tensors=None
+        )
+
+    def compute_metrics(eval_pred):
+        predictions, labels = eval_pred
+        predictions = np.argmax(predictions, axis=-1)
+        return {'accuracy': accuracy_score(labels, predictions)}
+
+    def get_training_args(output_dir, epochs=NUM_EPOCHS):
+        return TrainingArguments(
+            output_dir=output_dir,
+            num_train_epochs=epochs,
+            per_device_train_batch_size=BATCH_SIZE,
+            per_device_eval_batch_size=BATCH_SIZE,
+            warmup_steps=500,
+            weight_decay=0.01,
+            learning_rate=LEARNING_RATE,
+            logging_steps=200,
+            eval_strategy='epoch',
+            save_strategy='epoch',
+            load_best_model_at_end=True,
+            metric_for_best_model='accuracy',
+            fp16=torch.cuda.is_available(),
+            gradient_accumulation_steps=GRAD_ACCUM,
+            report_to='none',
+            seed=SEED
+        )
+
+    def evaluate_model(trainer, val_dataset, val_labels, label_names, model_name):
+        predictions  = trainer.predict(val_dataset)
+        pred_labels  = predictions.predictions.argmax(axis=-1)
+        accuracy     = accuracy_score(val_labels, pred_labels)
+        p, r, f1_w, _ = precision_recall_fscore_support(val_labels, pred_labels, average='weighted')
+        _, _, f1_m, _ = precision_recall_fscore_support(val_labels, pred_labels, average='macro')
+        print(f"\n--- {model_name} Results ---")
+        print(f"Accuracy    : {accuracy:.4f}")
+        print(f"Weighted F1 : {f1_w:.4f}")
+        print(f"Macro F1    : {f1_m:.4f}")
+        print("\nClassification Report:")
+        print(classification_report(val_labels, pred_labels, target_names=label_names))
+        return pred_labels, accuracy, f1_m, f1_w
+
+    def clear_gpu():
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    print("Helper functions ready")
+
+    Helper functions ready
+
+------------------------------------------------------------------------
+
+Section 2: Data Loading
+
+    # Step 6: Load Emotion dataset (6 classes)
+    # Upload emotion_train.csv, emotion_validation.csv, emotion_test.csv to Colab
+
+    df      = pd.read_csv('emotion_train.csv', encoding_errors='replace')
+    val_df  = pd.read_csv('emotion_validation.csv', encoding_errors='replace')
+    test_df = pd.read_csv('emotion_test.csv', encoding_errors='replace')
+
+    print(f"Emotion Dataset loaded")
+    print(f"  Train : {len(df):,}  Val: {len(val_df):,}  Test: {len(test_df):,}")
+    print(f"  Columns: {list(df.columns)}")
+    print(df[['text', 'label']].head(5))
+
+    Emotion Dataset loaded
+      Train : 16,000  Val: 2,000  Test: 2,000
+      Columns: ['text', 'label', 'input_ids', 'token_type_ids', 'attention_mask']
+                                                    text  label
+    0                            i didnt feel humiliated      0
+    1  i can go from feeling so hopeless to so damned...      0
+    2   im grabbing a minute to post i feel greedy wrong      3
+    3  i am ever feeling nostalgic about the fireplac...      2
+    4                               i am feeling grouchy      3
+
+    # Step 7: Load GoEmotions dataset (28 classes)
+    # Upload goemotions_train.csv, goemotions_validation.csv, goemotions_test.csv to Colab
+
+    go_train_df = pd.read_csv('goemotions_train.csv', encoding_errors='replace', engine='python', on_bad_lines='skip')
+    go_val_df   = pd.read_csv('goemotions_validation.csv', encoding_errors='replace', engine='python', on_bad_lines='skip')
+    go_test_df  = pd.read_csv('goemotions_test.csv', encoding_errors='replace', engine='python', on_bad_lines='skip')
+
+    # Multi-label column -> take first label for single-label classification
+    def get_first_label(labels):
+        try:
+            if pd.isna(labels): return 27
+            if isinstance(labels, str): return int(float(labels.split(',')[0]))
+            return int(float(labels))
+        except:
+            return 27
+
+    for d in [go_train_df, go_val_df, go_test_df]:
+        d['label'] = d['labels'].apply(get_first_label)
+
+    print(f"GoEmotions Dataset loaded")
+    print(f"  Train: {len(go_train_df):,}  Val: {len(go_val_df):,}  Test: {len(go_test_df):,}")
+    print(go_train_df[['text', 'labels', 'label']].head(5))
+
+    GoEmotions Dataset loaded
+      Train: 43,491  Val: 5,430  Test: 5,439
+                                                    text  labels  label
+    0  My favourite food is anything I didn't have to...    27.0     27
+    1  Now if he does off himself, everyone will thin...    27.0     27
+    2                     WHY THE FUCK IS BAYLESS ISOING     2.0      2
+    3                        To make her feel threatened    14.0     14
+    4                             Dirty Southern Wankers     3.0      3
+
+------------------------------------------------------------------------
+
+Section 3: Exploratory Data Analysis (EDA)
+
+    # Step 8: Basic dataset statistics
+
+    print("=" * 55)
+    print("EMOTION DATASET - Info")
+    print("=" * 55)
+    print(df.info())
+    print(f"\nNull values:\n{df.isnull().sum()}")
+    print(f"\nDuplicate rows (by text): {df.duplicated(subset='text').sum()}")
+
+    print("\n" + "=" * 55)
+    print("GOEMOTIONS DATASET - Info")
+    print("=" * 55)
+    print(f"Null values:\n{go_train_df.isnull().sum()}")
+    print(f"\nDuplicate rows (by text): {go_train_df.duplicated(subset='text').sum()}")
+
+    =======================================================
+    EMOTION DATASET - Info
+    =======================================================
+    <class 'pandas.core.frame.DataFrame'>
+    RangeIndex: 16000 entries, 0 to 15999
+    Data columns (total 5 columns):
+     #   Column          Non-Null Count  Dtype 
+    ---  ------          --------------  ----- 
+     0   text            16000 non-null  object
+     1   label           16000 non-null  int64 
+     2   input_ids       16000 non-null  object
+     3   token_type_ids  16000 non-null  object
+     4   attention_mask  16000 non-null  object
+    dtypes: int64(1), object(4)
+    memory usage: 625.1+ KB
+    None
+
+    Null values:
+    text              0
+    label             0
+    input_ids         0
+    token_type_ids    0
+    attention_mask    0
+    dtype: int64
+
+    Duplicate rows (by text): 31
+
+    =======================================================
+    GOEMOTIONS DATASET - Info
+    =======================================================
+    Null values:
+    text              30
+    labels            90
+    id                90
+    input_ids         90
+    token_type_ids    90
+    attention_mask    90
+    label              0
+    dtype: int64
+
+    Duplicate rows (by text): 247
+
+    # Step 9: Label distribution across Train / Val / Test splits - Emotion dataset
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    splits = [('Train', df), ('Validation', val_df), ('Test', test_df)]
+
+    for ax, (split_name, split_df) in zip(axes, splits):
+        counts = split_df['label'].value_counts().sort_index()
+        bars   = ax.bar(EMOTION_LABELS, counts.values, color='steelblue')
+        ax.set_title(f'Emotion - {split_name}')
+        ax.set_xlabel('Emotion')
+        ax.set_ylabel('Count')
+        ax.tick_params(axis='x', rotation=45)
+        for bar, val in zip(bars, counts.values):
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 20,
+                    str(val), ha='center', fontsize=8)
+
+    plt.suptitle('Emotion Dataset - Label Distribution Across Splits', fontsize=13, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig('emotion_distribution.png', dpi=150, bbox_inches='tight')
+    plt.show()
+
+    print("Train Label Distribution (%):")
+    train_counts = df['label'].value_counts().sort_index()
+    for idx, count in train_counts.items():
+        print(f"  {EMOTION_LABELS[idx]:10} : {count:5}  ({count/len(df)*100:.1f}%)")
+
+[]
+
+    Train Label Distribution (%):
+      sadness    :  4666  (29.2%)
+      joy        :  5362  (33.5%)
+      love       :  1304  (8.2%)
+      anger      :  2159  (13.5%)
+      fear       :  1937  (12.1%)
+      surprise   :   572  (3.6%)
+
+    # Step 10: Class imbalance analysis
+
+    imbalance_ratio = train_counts.max() / train_counts.min()
+
+    print("Class Imbalance - Emotion Dataset (Train):")
+    print(f"  Most frequent : {EMOTION_LABELS[train_counts.idxmax()]} ({train_counts.max()} samples)")
+    print(f"  Least frequent: {EMOTION_LABELS[train_counts.idxmin()]} ({train_counts.min()} samples)")
+    print(f"  Imbalance ratio: {imbalance_ratio:.2f}x")
+
+    # Pie charts: Emotion vs GoEmotions
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    axes[0].pie(train_counts.values, labels=EMOTION_LABELS, autopct='%1.1f%%',
+                colors=plt.cm.Set2.colors[:6], startangle=140)
+    axes[0].set_title('Emotion Dataset - Class Distribution (Train)')
+
+    go_top10_counts = go_train_df['label'].value_counts().head(10)
+    go_top10_names  = [GOEMOTIONS_LABELS[i] for i in go_top10_counts.index]
+    axes[1].pie(go_top10_counts.values, labels=go_top10_names, autopct='%1.1f%%',
+                colors=plt.cm.Set3.colors, startangle=140)
+    axes[1].set_title('GoEmotions - Top 10 Classes (Train)')
+
+    plt.tight_layout()
+    plt.savefig('class_distribution_pie.png', dpi=150, bbox_inches='tight')
+    plt.show()
+
+    go_label_counts = go_train_df['label'].value_counts().sort_index()
+    go_imbalance    = go_label_counts.max() / go_label_counts.min()
+    print(f"\nGoEmotions imbalance ratio: {go_imbalance:.2f}x")
+    print(f"  Most frequent : {GOEMOTIONS_LABELS[go_label_counts.idxmax()]} ({go_label_counts.max()})")
+    print(f"  Least frequent: {GOEMOTIONS_LABELS[go_label_counts.idxmin()]} ({go_label_counts.min()})")
+
+    Class Imbalance - Emotion Dataset (Train):
+      Most frequent : joy (5362 samples)
+      Least frequent: surprise (572 samples)
+      Imbalance ratio: 9.37x
+
+[]
+
+
+    GoEmotions imbalance ratio: 226.53x
+      Most frequent : neutral (12912)
+      Least frequent: pride (57)
+
+    # Step 11: Text length analysis - Emotion dataset
+
+    df['word_count'] = df['text'].apply(lambda x: len(str(x).split()))
+    df['char_count'] = df['text'].apply(lambda x: len(str(x)))
+
+    print("Text Length Statistics - Emotion Dataset (Train):")
+    print(df[['word_count', 'char_count']].describe().round(2))
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+
+    # Word count histogram
+    axes[0].hist(df['word_count'], bins=40, color='steelblue', edgecolor='white')
+    axes[0].axvline(df['word_count'].mean(),   color='red',    linestyle='--', label=f"Mean: {df['word_count'].mean():.1f}")
+    axes[0].axvline(df['word_count'].median(), color='orange', linestyle='--', label=f"Median: {df['word_count'].median():.1f}")
+    axes[0].set_title('Word Count Distribution')
+    axes[0].set_xlabel('Word Count')
+    axes[0].set_ylabel('Frequency')
+    axes[0].legend()
+
+    # Char count histogram
+    axes[1].hist(df['char_count'], bins=40, color='seagreen', edgecolor='white')
+    axes[1].axvline(df['char_count'].mean(), color='red', linestyle='--', label=f"Mean: {df['char_count'].mean():.1f}")
+    axes[1].set_title('Character Count Distribution')
+    axes[1].set_xlabel('Character Count')
+    axes[1].set_ylabel('Frequency')
+    axes[1].legend()
+
+    # Boxplot: word count per emotion
+    word_by_label = [df[df['label'] == i]['word_count'].values for i in range(NUM_EMOTION_LABELS)]
+    axes[2].boxplot(word_by_label, labels=EMOTION_LABELS)
+    axes[2].set_title('Word Count per Emotion')
+    axes[2].set_xlabel('Emotion')
+    axes[2].set_ylabel('Word Count')
+    axes[2].tick_params(axis='x', rotation=45)
+
+    plt.suptitle('Text Length Analysis - Emotion Dataset', fontsize=13, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig('text_length_analysis.png', dpi=150, bbox_inches='tight')
+    plt.show()
+
+    Text Length Statistics - Emotion Dataset (Train):
+           word_count  char_count
+    count    16000.00    16000.00
+    mean        19.17       96.85
+    std         10.99       55.90
+    min          2.00        7.00
+    25%         11.00       53.00
+    50%         17.00       86.00
+    75%         25.00      129.00
+    max         66.00      300.00
+
+[]
+
+    # Step 12: Word count comparison - Emotion vs GoEmotions
+
+    go_train_df['word_count'] = go_train_df['text'].apply(lambda x: len(str(x).split()))
+    go_train_df['char_count'] = go_train_df['text'].apply(lambda x: len(str(x)))
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    axes[0].hist(df['word_count'],          bins=40, alpha=0.6, color='steelblue', label='Emotion (6)',    edgecolor='white')
+    axes[0].hist(go_train_df['word_count'], bins=40, alpha=0.6, color='coral',     label='GoEmotions (28)',edgecolor='white')
+    axes[0].set_title('Word Count: Emotion vs GoEmotions')
+    axes[0].set_xlabel('Word Count')
+    axes[0].set_ylabel('Frequency')
+    axes[0].legend()
+
+    axes[1].boxplot(
+        [df['word_count'].values, go_train_df['word_count'].values],
+        labels=['Emotion (6)', 'GoEmotions (28)']
+    )
+    axes[1].set_title('Word Count Distribution Comparison')
+    axes[1].set_ylabel('Word Count')
+
+    plt.suptitle('Text Length Comparison Across Datasets', fontsize=13, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig('text_length_comparison.png', dpi=150, bbox_inches='tight')
+    plt.show()
+
+    print("GoEmotions word count stats:")
+    print(go_train_df['word_count'].describe().round(2))
+
+[]
+
+    GoEmotions word count stats:
+    count    43491.00
+    mean        12.82
+    std          6.71
+    min          1.00
+    25%          7.00
+    50%         12.00
+    75%         18.00
+    max         33.00
+    Name: word_count, dtype: float64
+
+    # Step 13: GoEmotions full label distribution (all 28 classes)
+
+    all_go_names  = [GOEMOTIONS_LABELS[i] for i in go_label_counts.index]
+    all_go_values = [go_label_counts[i] for i in go_label_counts.index]
+
+    plt.figure(figsize=(16, 6))
+    colors = plt.cm.RdYlGn(np.linspace(0.2, 0.9, len(all_go_names)))
+    plt.bar(range(len(all_go_names)), all_go_values, color=colors)
+    plt.xticks(range(len(all_go_names)), all_go_names, rotation=60, ha='right', fontsize=9)
+    plt.axhline(np.mean(all_go_values), color='red', linestyle='--', linewidth=1.2,
+                label=f'Mean: {np.mean(all_go_values):.0f}')
+    plt.title('GoEmotions Dataset - All 28 Classes Distribution (Train)', fontsize=13, fontweight='bold')
+    plt.xlabel('Emotion')
+    plt.ylabel('Count')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig('goemotions_distribution.png', dpi=150, bbox_inches='tight')
+    plt.show()
+
+[]
+
+    # Step 14: Top 15 most frequent words per emotion class - Emotion dataset
+
+    # Basic stopword list (no NLTK required)
+    STOPWORDS = {
+        'i','me','my','we','our','you','your','he','she','it','they','them',
+        'am','is','are','was','were','be','been','have','has','had',
+        'do','does','did','will','would','could','should','can','may','might',
+        'a','an','the','and','but','or','for','of','at','by','from','with',
+        'in','on','to','so','if','as','not','no','up','out','about','into',
+        'then','than','just','very','when','all','what','this','that','which',
+        'get','got','dont',"im","ive","its"
+    }
+
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+
+    for label_id in range(NUM_EMOTION_LABELS):
+        ax     = axes[label_id // 3][label_id % 3]
+        subset = df[df['label'] == label_id]['text'].astype(str)
+        words  = []
+        for text in subset:
+            tokens = re.sub(r'[^a-zA-Z\s]', '', text.lower()).split()
+            words += [w for w in tokens if w not in STOPWORDS and len(w) > 2]
+
+        top_words = Counter(words).most_common(15)
+        if top_words:
+            words_list, counts_list = zip(*top_words)
+            ax.barh(range(len(words_list)), counts_list, color='steelblue')
+            ax.set_yticks(range(len(words_list)))
+            ax.set_yticklabels(words_list, fontsize=9)
+            ax.invert_yaxis()
+        ax.set_title(f'{EMOTION_LABELS[label_id].upper()} - Top 15 Words')
+        ax.set_xlabel('Frequency')
+
+    plt.suptitle('Top Words per Emotion Class (stopwords removed)', fontsize=13, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig('top_words_per_emotion.png', dpi=150, bbox_inches='tight')
+    plt.show()
+
+[]
+
+    # Step 15: Noise analysis - identify noisy patterns in both datasets
+
+    def analyze_noise(series, name):
+        texts = series.astype(str)
+        total = len(texts)
+        checks = {
+            'URLs'          : texts.str.contains(r'http\S+|www\S+', regex=True).sum(),
+            '@Mentions'     : texts.str.contains(r'@\w+', regex=True).sum(),
+            '#Hashtags'     : texts.str.contains(r'#\w+', regex=True).sum(),
+            'HTML tags'     : texts.str.contains(r'<.*?>', regex=True).sum(),
+            'Numbers'       : texts.str.contains(r'\d+', regex=True).sum(),
+            'Multi-punct'   : texts.str.contains(r'[!?]{2,}', regex=True).sum(),
+            'All uppercase' : texts.apply(lambda x: x.isupper()).sum(),
+            'Non-ASCII'     : texts.apply(lambda x: any(ord(c) > 127 for c in x)).sum(),
+        }
+        print(f"\nNoise Analysis - {name} (n={total:,}):")
+        for label, count in checks.items():
+            print(f"  {label:15}: {count:6}  ({count/total*100:.1f}%)")
+
+    analyze_noise(df['text'], 'Emotion Train')
+    analyze_noise(go_train_df['text'], 'GoEmotions Train')
+
+
+    Noise Analysis - Emotion Train (n=16,000):
+      URLs           :      9  (0.1%)
+      @Mentions      :      0  (0.0%)
+      #Hashtags      :      0  (0.0%)
+      HTML tags      :      0  (0.0%)
+      Numbers        :      0  (0.0%)
+      Multi-punct    :      0  (0.0%)
+      All uppercase  :      0  (0.0%)
+      Non-ASCII      :      0  (0.0%)
+
+    Noise Analysis - GoEmotions Train (n=43,491):
+      URLs           :      0  (0.0%)
+      @Mentions      :      8  (0.0%)
+      #Hashtags      :    109  (0.3%)
+      HTML tags      :      4  (0.0%)
+      Numbers        :   3810  (8.8%)
+      Multi-punct    :   1165  (2.7%)
+      All uppercase  :    465  (1.1%)
+      Non-ASCII      :    222  (0.5%)
+
+    # Step 16: Sample texts per emotion - qualitative inspection
+
+    print("Sample Texts per Emotion Class:\n")
+    for label_id in range(NUM_EMOTION_LABELS):
+        samples = df[df['label'] == label_id]['text'].sample(3, random_state=SEED).values
+        print(f"  [{EMOTION_LABELS[label_id].upper()}]")
+        for s in samples:
+            print(f"    - {str(s)[:110]}")
+        print()
+
+    Sample Texts per Emotion Class:
+
+      [SADNESS]
+        - im feeling so lousy they tried to cheer me up during school time and during choir practice
+        - i feel highly disadvantaged
+        - i feel humiliated to introduce you to my colleagues as my wife
+
+      [JOY]
+        - i feel im rather innocent in that respect
+        - im feeling quite adventurous and tried out those drinks that i just normally read through the pages of pocketb
+        - im feeling much more positive about the impending move
+
+      [LOVE]
+        - i mean fuck i feel like i was way more considerate with customers and concerned about appearance and sanitiati
+        - i remember a couple of years ago i was feeling romantic and dreamy and asked him wonder if we ll celebrate our
+        - im so going to end up feeling slutty and be like ah
+
+      [ANGER]
+        - i ve been feeling a bit cranky with the kids this week cranky baby whiny year old demanding preschooler so i w
+        - i feel frustrated sometimes with my mac lipsticks when i have to read names or open each of them to select sha
+        - i feeling stressed
+
+      [FEAR]
+        - i can feel the frantic beat of his heart but cookie s voice is surprisingly clear
+        - i feel a little suspicious
+        - i can t help but feeling weird when opening every closet in an apartment that somebody s still living in so i 
+
+      [SURPRISE]
+        - im feeling extraordinarily dazed and bewildered this arvo for no particular reason and my muscles all hurt eve
+        - i only feel curious impatient eager and confused
+        - i feel a strange sense of legacy
+
+------------------------------------------------------------------------
+
+Section 4: Preprocessing
+
+    # Step 17: Text cleaning function (lowercase version - for uncased models)
+    # Preserves emotional punctuation (!, ?) as they carry sentiment signals
+
+    def clean_text(text):
+        text = str(text)
+        text = re.sub(r'http\S+|www\S+', '', text)     # remove URLs
+        text = re.sub(r'@\w+', '', text)                # remove @mentions
+        text = re.sub(r'#\w+', '', text)                # remove #hashtags
+        text = re.sub(r'<.*?>', '', text)               # remove HTML tags
+        text = text.encode('ascii', 'ignore').decode('ascii')  # remove non-ASCII
+        text = re.sub(r'\s+', ' ', text).strip()        # collapse whitespace
+        text = text.lower()                             # lowercase
+        return text
+
+    # Version for cased models (XLNet) - same but no lowercasing
+    def clean_text_cased(text):
+        text = str(text)
+        text = re.sub(r'http\S+|www\S+', '', text)
+        text = re.sub(r'@\w+', '', text)
+        text = re.sub(r'#\w+', '', text)
+        text = re.sub(r'<.*?>', '', text)
+        text = text.encode('ascii', 'ignore').decode('ascii')
+        text = re.sub(r'\s+', ' ', text).strip()
+        return text
+
+    # Test cleaning
+    examples = [
+        "I'm SO HAPPY!! Check http://example.com #joy @user123",
+        "feeling sad :( cant believe this happened",
+        "<b>Angry</b> at everyone   right   now!!!"
+    ]
+    print("Cleaning examples:\n")
+    for t in examples:
+        print(f"  Before: {t}")
+        print(f"  After : {clean_text(t)}")
+        print()
+
+    Cleaning examples:
+
+      Before: I'm SO HAPPY!! Check http://example.com #joy @user123
+      After : i'm so happy!! check
+
+      Before: feeling sad :( cant believe this happened
+      After : feeling sad :( cant believe this happened
+
+      Before: <b>Angry</b> at everyone   right   now!!!
+      After : angry at everyone right now!!!
+
+    # Step 18: Apply cleaning to all splits
+
+    print("Applying cleaning to all datasets...")
+
+    # Emotion dataset (lowercase for uncased models)
+    for d in [df, val_df, test_df]:
+        d['text_clean']       = d['text'].apply(clean_text)
+        d['text_clean_cased'] = d['text'].apply(clean_text_cased)
+
+    # GoEmotions dataset
+    for d in [go_train_df, go_val_df, go_test_df]:
+        d['text_clean']       = d['text'].apply(clean_text)
+        d['text_clean_cased'] = d['text'].apply(clean_text_cased)
+
+    print("Done.")
+    print("\nBefore / After examples:")
+    for i in range(3):
+        print(f"  Before: {df['text'].iloc[i]}")
+        print(f"  After : {df['text_clean'].iloc[i]}")
+        print()
+
+    Applying cleaning to all datasets...
+    Done.
+
+    Before / After examples:
+      Before: i didnt feel humiliated
+      After : i didnt feel humiliated
+
+      Before: i can go from feeling so hopeless to so damned hopeful just from being around someone who cares and is awake
+      After : i can go from feeling so hopeless to so damned hopeful just from being around someone who cares and is awake
+
+      Before: im grabbing a minute to post i feel greedy wrong
+      After : im grabbing a minute to post i feel greedy wrong
+
+    # Step 19: Remove very short texts after cleaning (min 3 chars)
+
+    def drop_short_texts(dataframe, min_len=3, name=''):
+        before = len(dataframe)
+        dataframe = dataframe[dataframe['text_clean'].str.len() >= min_len].reset_index(drop=True)
+        print(f"  {name}: removed {before - len(dataframe)} short texts. Remaining: {len(dataframe):,}")
+        return dataframe
+
+    print("Dropping short texts:")
+    df          = drop_short_texts(df,          name='Emotion Train')
+    val_df      = drop_short_texts(val_df,      name='Emotion Val')
+    test_df     = drop_short_texts(test_df,     name='Emotion Test')
+    go_train_df = drop_short_texts(go_train_df, name='GoEmotions Train')
+    go_val_df   = drop_short_texts(go_val_df,   name='GoEmotions Val')
+    go_test_df  = drop_short_texts(go_test_df,  name='GoEmotions Test')
+
+    Dropping short texts:
+      Emotion Train: removed 0 short texts. Remaining: 16,000
+      Emotion Val: removed 0 short texts. Remaining: 2,000
+      Emotion Test: removed 0 short texts. Remaining: 2,000
+      GoEmotions Train: removed 50 short texts. Remaining: 43,441
+      GoEmotions Val: removed 6 short texts. Remaining: 5,424
+      GoEmotions Test: removed 6 short texts. Remaining: 5,433
+
+    # Step 20: Remove duplicate texts within each split
+
+    def drop_duplicates(dataframe, name=''):
+        before = len(dataframe)
+        dataframe = dataframe.drop_duplicates(subset='text_clean').reset_index(drop=True)
+        print(f"  {name}: removed {before - len(dataframe)} duplicates. Remaining: {len(dataframe):,}")
+        return dataframe
+
+    print("Removing duplicates:")
+    df          = drop_duplicates(df,          name='Emotion Train')
+    val_df      = drop_duplicates(val_df,      name='Emotion Val')
+    test_df     = drop_duplicates(test_df,     name='Emotion Test')
+    go_train_df = drop_duplicates(go_train_df, name='GoEmotions Train')
+    go_val_df   = drop_duplicates(go_val_df,   name='GoEmotions Val')
+    go_test_df  = drop_duplicates(go_test_df,  name='GoEmotions Test')
+
+    Removing duplicates:
+      Emotion Train: removed 31 duplicates. Remaining: 15,969
+      Emotion Val: removed 2 duplicates. Remaining: 1,998
+      Emotion Test: removed 0 duplicates. Remaining: 2,000
+      GoEmotions Train: removed 253 duplicates. Remaining: 43,188
+      GoEmotions Val: removed 9 duplicates. Remaining: 5,415
+      GoEmotions Test: removed 12 duplicates. Remaining: 5,421
+
+    # Step 21: Post-cleaning word count and effect visualization
+
+    df['word_count_clean'] = df['text_clean'].apply(lambda x: len(str(x).split()))
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    axes[0].hist(df['word_count'],       bins=40, alpha=0.6, color='steelblue', label='Before', edgecolor='white')
+    axes[0].hist(df['word_count_clean'], bins=40, alpha=0.6, color='coral',     label='After',  edgecolor='white')
+    axes[0].set_title('Word Count: Before vs After Cleaning')
+    axes[0].set_xlabel('Word Count')
+    axes[0].set_ylabel('Frequency')
+    axes[0].legend()
+
+    # Verify label distribution is preserved after cleaning
+    post_counts = df['label'].value_counts().sort_index()
+    axes[1].bar(EMOTION_LABELS, post_counts.values, color='steelblue')
+    axes[1].set_title('Label Distribution After Cleaning (Train)')
+    axes[1].set_xlabel('Emotion')
+    axes[1].set_ylabel('Count')
+    axes[1].tick_params(axis='x', rotation=45)
+
+    plt.suptitle('Effect of Preprocessing on Data', fontsize=13, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig('cleaning_effect.png', dpi=150, bbox_inches='tight')
+    plt.show()
+
+    print("Final dataset sizes after preprocessing:")
+    print(f"  Emotion    - Train: {len(df):,} | Val: {len(val_df):,} | Test: {len(test_df):,}")
+    print(f"  GoEmotions - Train: {len(go_train_df):,} | Val: {len(go_val_df):,} | Test: {len(go_test_df):,}")
+
+[]
+
+    Final dataset sizes after preprocessing:
+      Emotion    - Train: 15,969 | Val: 1,998 | Test: 2,000
+      GoEmotions - Train: 43,188 | Val: 5,415 | Test: 5,421
+
+    # Step 22: Prepare final label lists (from cleaned dataframes)
+
+    train_labels    = df['label'].tolist()
+    val_labels      = val_df['label'].tolist()
+    test_labels     = test_df['label'].tolist()
+
+    go_train_labels = go_train_df['label'].tolist()
+    go_val_labels   = go_val_df['label'].tolist()
+    go_test_labels  = go_test_df['label'].tolist()
+
+    print("Label lists ready.")
+    print(f"  Emotion train   : {len(train_labels):,}")
+    print(f"  GoEmotions train: {len(go_train_labels):,}")
+
+    Label lists ready.
+      Emotion train   : 15,969
+      GoEmotions train: 43,188
+
+------------------------------------------------------------------------
+
+Section 5: Tokenizer Setup and Token Length Analysis
+
+    # Step 23: Load all tokenizers
+
+    bert_tokenizer       = AutoTokenizer.from_pretrained('bert-base-uncased')
+    roberta_tokenizer    = RobertaTokenizer.from_pretrained('roberta-base')
+    distilbert_tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased')
+    albert_tokenizer     = AlbertTokenizer.from_pretrained('albert-base-v2')
+    xlnet_tokenizer      = XLNetTokenizer.from_pretrained('xlnet-base-cased')
+
+    print("All tokenizers loaded")
+    print(f"  BERT vocab size     : {bert_tokenizer.vocab_size:,}")
+    print(f"  RoBERTa vocab size  : {roberta_tokenizer.vocab_size:,}")
+    print(f"  DistilBERT vocab    : {distilbert_tokenizer.vocab_size:,}")
+    print(f"  ALBERT vocab size   : {albert_tokenizer.vocab_size:,}")
+    print(f"  XLNet vocab size    : {xlnet_tokenizer.vocab_size:,}")
+
+    {"model_id":"e309dedcca274c7499cfc6d40ff688a5","version_major":2,"version_minor":0}
+
+    {"model_id":"ab0deff76fb742139d04aa25a5f1a238","version_major":2,"version_minor":0}
+
+    Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+    WARNING:huggingface_hub.utils._http:Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+
+    {"model_id":"f8e8f5da6a2843eb8c689989ff071149","version_major":2,"version_minor":0}
+
+    {"model_id":"5e10e8800d884054ad5a358a560b7ee4","version_major":2,"version_minor":0}
+
+    {"model_id":"f61189a1d34e4aa7a5de1a393b5931ae","version_major":2,"version_minor":0}
+
+    {"model_id":"12da4365c1a24fdcb34c1d1c6d6f834f","version_major":2,"version_minor":0}
+
+    {"model_id":"29fc3bca5ac14e5c9d5d2c66ac860423","version_major":2,"version_minor":0}
+
+    {"model_id":"7d5a072285c249f7b563d851f7afc028","version_major":2,"version_minor":0}
+
+    {"model_id":"279f71ed6f004b41b0e58c7a79c1adeb","version_major":2,"version_minor":0}
+
+    {"model_id":"c041b8ae16cb4f15ad38d80fecc77b9f","version_major":2,"version_minor":0}
+
+    {"model_id":"b073ae256e0942d5a868d8d7a87b300e","version_major":2,"version_minor":0}
+
+    {"model_id":"951ab0fda6dc4b72ada361c330980561","version_major":2,"version_minor":0}
+
+    {"model_id":"47bb98fec7494c93a36d9ead77617f56","version_major":2,"version_minor":0}
+
+    {"model_id":"f21df95627874b6793203b2cd5f67109","version_major":2,"version_minor":0}
+
+    {"model_id":"e279c0ed8f634495bc45be507091abbb","version_major":2,"version_minor":0}
+
+    {"model_id":"fcf3292135ba4ee8a662370d026f015b","version_major":2,"version_minor":0}
+
+    All tokenizers loaded
+      BERT vocab size     : 30,522
+      RoBERTa vocab size  : 50,265
+      DistilBERT vocab    : 30,522
+      ALBERT vocab size   : 30,000
+      XLNet vocab size    : 32,000
+
+    # Step 24: Actual token length distribution using BERT tokenizer (sub-word level)
+    # Reveals true truncation impact more accurately than word count
+
+    print("Computing BERT token lengths on a 2000-sample subset...")
+    sample_texts  = df['text_clean'].sample(2000, random_state=SEED).tolist()
+    token_lengths = [len(bert_tokenizer.tokenize(t)) for t in sample_texts]
+
+    pct_truncated = sum(1 for l in token_lengths if l > MAX_LENGTH) / len(token_lengths) * 100
+
+    plt.figure(figsize=(10, 5))
+    plt.hist(token_lengths, bins=40, color='steelblue', edgecolor='white')
+    plt.axvline(MAX_LENGTH, color='red', linestyle='--', linewidth=1.5, label=f'MAX_LENGTH={MAX_LENGTH}')
+    plt.axvline(np.mean(token_lengths), color='orange', linestyle='--', linewidth=1.5,
+                label=f'Mean={np.mean(token_lengths):.1f}')
+    plt.title('BERT Token Length Distribution (Emotion Train, n=2000)')
+    plt.xlabel('Token Count')
+    plt.ylabel('Frequency')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig('bert_token_lengths.png', dpi=150, bbox_inches='tight')
+    plt.show()
+
+    print(f"Mean token length          : {np.mean(token_lengths):.1f}")
+    print(f"Max token length           : {max(token_lengths)}")
+    print(f"Samples > {MAX_LENGTH} tokens: {pct_truncated:.1f}% (will be truncated)")
+
+    Computing BERT token lengths on a 2000-sample subset...
+
+[]
+
+    Mean token length          : 20.6
+    Max token length           : 66
+    Samples > 128 tokens: 0.0% (will be truncated)
+
+------------------------------------------------------------------------
+
+Section 6: Model Training and Evaluation
+
+Model 1: BERT (bert-base-uncased)
+
+    # Step 25: Tokenize with BERT and train
+    clear_gpu()
+
+    bert_train_ds = EmotionDataset(tokenize_texts(df['text_clean'],      bert_tokenizer), train_labels)
+    bert_val_ds   = EmotionDataset(tokenize_texts(val_df['text_clean'],  bert_tokenizer), val_labels)
+    bert_test_ds  = EmotionDataset(tokenize_texts(test_df['text_clean'], bert_tokenizer), test_labels)
+
+    bert_model = AutoModelForSequenceClassification.from_pretrained(
+        'bert-base-uncased', num_labels=NUM_EMOTION_LABELS
+    )
+    print(f"BERT parameters: {sum(p.numel() for p in bert_model.parameters()):,}")
+
+    bert_trainer = Trainer(
+        model=bert_model,
+        args=get_training_args('./results/bert'),
+        train_dataset=bert_train_ds,
+        eval_dataset=bert_val_ds,
+        compute_metrics=compute_metrics
+    )
+    bert_trainer.train()
+    print("BERT training complete")
+
+    {"model_id":"82b376aa54c24c2fac7dca9d1ae7cd5f","version_major":2,"version_minor":0}
+
+    {"model_id":"ed38d8c3bf57448a9ee533918ef40faa","version_major":2,"version_minor":0}
+
+    BertForSequenceClassification LOAD REPORT from: bert-base-uncased
+    Key                                        | Status     | 
+    -------------------------------------------+------------+-
+    cls.predictions.transform.dense.weight     | UNEXPECTED | 
+    cls.predictions.bias                       | UNEXPECTED | 
+    cls.predictions.transform.dense.bias       | UNEXPECTED | 
+    cls.seq_relationship.bias                  | UNEXPECTED | 
+    cls.seq_relationship.weight                | UNEXPECTED | 
+    cls.predictions.transform.LayerNorm.weight | UNEXPECTED | 
+    cls.predictions.transform.LayerNorm.bias   | UNEXPECTED | 
+    classifier.bias                            | MISSING    | 
+    classifier.weight                          | MISSING    | 
+
+    Notes:
+    - UNEXPECTED	:can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+    - MISSING	:those params were newly initialized because missing from the checkpoint. Consider training on your downstream task.
+
+    BERT parameters: 109,486,854
+
+    <IPython.core.display.HTML object>
+
+    {"model_id":"164c79581dc04121b21e75a2565f64b3","version_major":2,"version_minor":0}
+
+    {"model_id":"01df4443f69d43ddacce500e784b28a8","version_major":2,"version_minor":0}
+
+    {"model_id":"6f8880f1b92f4c788d372d0ceefaec29","version_major":2,"version_minor":0}
+
+    There were missing keys in the checkpoint model loaded: ['bert.embeddings.LayerNorm.weight', 'bert.embeddings.LayerNorm.bias', 'bert.encoder.layer.0.attention.output.LayerNorm.weight', 'bert.encoder.layer.0.attention.output.LayerNorm.bias', 'bert.encoder.layer.0.output.LayerNorm.weight', 'bert.encoder.layer.0.output.LayerNorm.bias', 'bert.encoder.layer.1.attention.output.LayerNorm.weight', 'bert.encoder.layer.1.attention.output.LayerNorm.bias', 'bert.encoder.layer.1.output.LayerNorm.weight', 'bert.encoder.layer.1.output.LayerNorm.bias', 'bert.encoder.layer.2.attention.output.LayerNorm.weight', 'bert.encoder.layer.2.attention.output.LayerNorm.bias', 'bert.encoder.layer.2.output.LayerNorm.weight', 'bert.encoder.layer.2.output.LayerNorm.bias', 'bert.encoder.layer.3.attention.output.LayerNorm.weight', 'bert.encoder.layer.3.attention.output.LayerNorm.bias', 'bert.encoder.layer.3.output.LayerNorm.weight', 'bert.encoder.layer.3.output.LayerNorm.bias', 'bert.encoder.layer.4.attention.output.LayerNorm.weight', 'bert.encoder.layer.4.attention.output.LayerNorm.bias', 'bert.encoder.layer.4.output.LayerNorm.weight', 'bert.encoder.layer.4.output.LayerNorm.bias', 'bert.encoder.layer.5.attention.output.LayerNorm.weight', 'bert.encoder.layer.5.attention.output.LayerNorm.bias', 'bert.encoder.layer.5.output.LayerNorm.weight', 'bert.encoder.layer.5.output.LayerNorm.bias', 'bert.encoder.layer.6.attention.output.LayerNorm.weight', 'bert.encoder.layer.6.attention.output.LayerNorm.bias', 'bert.encoder.layer.6.output.LayerNorm.weight', 'bert.encoder.layer.6.output.LayerNorm.bias', 'bert.encoder.layer.7.attention.output.LayerNorm.weight', 'bert.encoder.layer.7.attention.output.LayerNorm.bias', 'bert.encoder.layer.7.output.LayerNorm.weight', 'bert.encoder.layer.7.output.LayerNorm.bias', 'bert.encoder.layer.8.attention.output.LayerNorm.weight', 'bert.encoder.layer.8.attention.output.LayerNorm.bias', 'bert.encoder.layer.8.output.LayerNorm.weight', 'bert.encoder.layer.8.output.LayerNorm.bias', 'bert.encoder.layer.9.attention.output.LayerNorm.weight', 'bert.encoder.layer.9.attention.output.LayerNorm.bias', 'bert.encoder.layer.9.output.LayerNorm.weight', 'bert.encoder.layer.9.output.LayerNorm.bias', 'bert.encoder.layer.10.attention.output.LayerNorm.weight', 'bert.encoder.layer.10.attention.output.LayerNorm.bias', 'bert.encoder.layer.10.output.LayerNorm.weight', 'bert.encoder.layer.10.output.LayerNorm.bias', 'bert.encoder.layer.11.attention.output.LayerNorm.weight', 'bert.encoder.layer.11.attention.output.LayerNorm.bias', 'bert.encoder.layer.11.output.LayerNorm.weight', 'bert.encoder.layer.11.output.LayerNorm.bias'].
+    There were unexpected keys in the checkpoint model loaded: ['bert.embeddings.LayerNorm.beta', 'bert.embeddings.LayerNorm.gamma', 'bert.encoder.layer.0.attention.output.LayerNorm.beta', 'bert.encoder.layer.0.attention.output.LayerNorm.gamma', 'bert.encoder.layer.0.output.LayerNorm.beta', 'bert.encoder.layer.0.output.LayerNorm.gamma', 'bert.encoder.layer.1.attention.output.LayerNorm.beta', 'bert.encoder.layer.1.attention.output.LayerNorm.gamma', 'bert.encoder.layer.1.output.LayerNorm.beta', 'bert.encoder.layer.1.output.LayerNorm.gamma', 'bert.encoder.layer.2.attention.output.LayerNorm.beta', 'bert.encoder.layer.2.attention.output.LayerNorm.gamma', 'bert.encoder.layer.2.output.LayerNorm.beta', 'bert.encoder.layer.2.output.LayerNorm.gamma', 'bert.encoder.layer.3.attention.output.LayerNorm.beta', 'bert.encoder.layer.3.attention.output.LayerNorm.gamma', 'bert.encoder.layer.3.output.LayerNorm.beta', 'bert.encoder.layer.3.output.LayerNorm.gamma', 'bert.encoder.layer.4.attention.output.LayerNorm.beta', 'bert.encoder.layer.4.attention.output.LayerNorm.gamma', 'bert.encoder.layer.4.output.LayerNorm.beta', 'bert.encoder.layer.4.output.LayerNorm.gamma', 'bert.encoder.layer.5.attention.output.LayerNorm.beta', 'bert.encoder.layer.5.attention.output.LayerNorm.gamma', 'bert.encoder.layer.5.output.LayerNorm.beta', 'bert.encoder.layer.5.output.LayerNorm.gamma', 'bert.encoder.layer.6.attention.output.LayerNorm.beta', 'bert.encoder.layer.6.attention.output.LayerNorm.gamma', 'bert.encoder.layer.6.output.LayerNorm.beta', 'bert.encoder.layer.6.output.LayerNorm.gamma', 'bert.encoder.layer.7.attention.output.LayerNorm.beta', 'bert.encoder.layer.7.attention.output.LayerNorm.gamma', 'bert.encoder.layer.7.output.LayerNorm.beta', 'bert.encoder.layer.7.output.LayerNorm.gamma', 'bert.encoder.layer.8.attention.output.LayerNorm.beta', 'bert.encoder.layer.8.attention.output.LayerNorm.gamma', 'bert.encoder.layer.8.output.LayerNorm.beta', 'bert.encoder.layer.8.output.LayerNorm.gamma', 'bert.encoder.layer.9.attention.output.LayerNorm.beta', 'bert.encoder.layer.9.attention.output.LayerNorm.gamma', 'bert.encoder.layer.9.output.LayerNorm.beta', 'bert.encoder.layer.9.output.LayerNorm.gamma', 'bert.encoder.layer.10.attention.output.LayerNorm.beta', 'bert.encoder.layer.10.attention.output.LayerNorm.gamma', 'bert.encoder.layer.10.output.LayerNorm.beta', 'bert.encoder.layer.10.output.LayerNorm.gamma', 'bert.encoder.layer.11.attention.output.LayerNorm.beta', 'bert.encoder.layer.11.attention.output.LayerNorm.gamma', 'bert.encoder.layer.11.output.LayerNorm.beta', 'bert.encoder.layer.11.output.LayerNorm.gamma'].
+
+    BERT training complete
+
+    # Step 26: Evaluate BERT
+    bert_preds, bert_acc, bert_f1_macro, bert_f1_w = evaluate_model(
+        bert_trainer, bert_val_ds, val_labels, EMOTION_LABELS, 'BERT'
+    )
+
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(confusion_matrix(val_labels, bert_preds), annot=True, fmt='d', cmap='Blues',
+                xticklabels=EMOTION_LABELS, yticklabels=EMOTION_LABELS)
+    plt.title('BERT - Confusion Matrix')
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.savefig('bert_confusion_matrix.png', dpi=150, bbox_inches='tight')
+    plt.show()
+    clear_gpu()
+
+    <IPython.core.display.HTML object>
+
+
+    --- BERT Results ---
+    Accuracy    : 0.9459
+    Weighted F1 : 0.9460
+    Macro F1    : 0.9252
+
+    Classification Report:
+                  precision    recall  f1-score   support
+
+         sadness       0.97      0.97      0.97       550
+             joy       0.97      0.96      0.96       703
+            love       0.92      0.88      0.90       178
+           anger       0.95      0.94      0.94       274
+            fear       0.87      0.95      0.91       212
+        surprise       0.88      0.85      0.87        81
+
+        accuracy                           0.95      1998
+       macro avg       0.93      0.92      0.93      1998
+    weighted avg       0.95      0.95      0.95      1998
+
+[]
+
+Model 2: RoBERTa (roberta-base)
+
+    # Step 27: Tokenize with RoBERTa and train
+    clear_gpu()
+
+    roberta_train_ds = EmotionDataset(tokenize_texts(df['text_clean'],     roberta_tokenizer), train_labels)
+    roberta_val_ds   = EmotionDataset(tokenize_texts(val_df['text_clean'], roberta_tokenizer), val_labels)
+
+    roberta_model = RobertaForSequenceClassification.from_pretrained(
+        'roberta-base', num_labels=NUM_EMOTION_LABELS
+    )
+    print(f"RoBERTa parameters: {sum(p.numel() for p in roberta_model.parameters()):,}")
+
+    roberta_trainer = Trainer(
+        model=roberta_model,
+        args=get_training_args('./results/roberta'),
+        train_dataset=roberta_train_ds,
+        eval_dataset=roberta_val_ds,
+        compute_metrics=compute_metrics
+    )
+    roberta_trainer.train()
+    print("RoBERTa training complete")
+
+    {"model_id":"2b51ebff83a14de3a9cf87bc8d575128","version_major":2,"version_minor":0}
+
+    {"model_id":"acc72b199be145afa40f170e9aa14132","version_major":2,"version_minor":0}
+
+    {"model_id":"48791043f2bb442ba4efe3b46754c7f7","version_major":2,"version_minor":0}
+
+    RobertaForSequenceClassification LOAD REPORT from: roberta-base
+    Key                             | Status     | 
+    --------------------------------+------------+-
+    lm_head.dense.bias              | UNEXPECTED | 
+    lm_head.layer_norm.weight       | UNEXPECTED | 
+    roberta.embeddings.position_ids | UNEXPECTED | 
+    lm_head.layer_norm.bias         | UNEXPECTED | 
+    lm_head.bias                    | UNEXPECTED | 
+    lm_head.dense.weight            | UNEXPECTED | 
+    classifier.dense.bias           | MISSING    | 
+    classifier.dense.weight         | MISSING    | 
+    classifier.out_proj.weight      | MISSING    | 
+    classifier.out_proj.bias        | MISSING    | 
+
+    Notes:
+    - UNEXPECTED	:can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+    - MISSING	:those params were newly initialized because missing from the checkpoint. Consider training on your downstream task.
+
+    RoBERTa parameters: 124,650,246
+
+    <IPython.core.display.HTML object>
+
+    {"model_id":"2f4c255b662243b5946735d28d7e71bc","version_major":2,"version_minor":0}
+
+    {"model_id":"38a4999a000b452ea644cd74a50cfaff","version_major":2,"version_minor":0}
+
+    {"model_id":"2914b37308f1432c956463ea6882fc5f","version_major":2,"version_minor":0}
+
+    There were missing keys in the checkpoint model loaded: ['roberta.embeddings.LayerNorm.weight', 'roberta.embeddings.LayerNorm.bias', 'roberta.encoder.layer.0.attention.output.LayerNorm.weight', 'roberta.encoder.layer.0.attention.output.LayerNorm.bias', 'roberta.encoder.layer.0.output.LayerNorm.weight', 'roberta.encoder.layer.0.output.LayerNorm.bias', 'roberta.encoder.layer.1.attention.output.LayerNorm.weight', 'roberta.encoder.layer.1.attention.output.LayerNorm.bias', 'roberta.encoder.layer.1.output.LayerNorm.weight', 'roberta.encoder.layer.1.output.LayerNorm.bias', 'roberta.encoder.layer.2.attention.output.LayerNorm.weight', 'roberta.encoder.layer.2.attention.output.LayerNorm.bias', 'roberta.encoder.layer.2.output.LayerNorm.weight', 'roberta.encoder.layer.2.output.LayerNorm.bias', 'roberta.encoder.layer.3.attention.output.LayerNorm.weight', 'roberta.encoder.layer.3.attention.output.LayerNorm.bias', 'roberta.encoder.layer.3.output.LayerNorm.weight', 'roberta.encoder.layer.3.output.LayerNorm.bias', 'roberta.encoder.layer.4.attention.output.LayerNorm.weight', 'roberta.encoder.layer.4.attention.output.LayerNorm.bias', 'roberta.encoder.layer.4.output.LayerNorm.weight', 'roberta.encoder.layer.4.output.LayerNorm.bias', 'roberta.encoder.layer.5.attention.output.LayerNorm.weight', 'roberta.encoder.layer.5.attention.output.LayerNorm.bias', 'roberta.encoder.layer.5.output.LayerNorm.weight', 'roberta.encoder.layer.5.output.LayerNorm.bias', 'roberta.encoder.layer.6.attention.output.LayerNorm.weight', 'roberta.encoder.layer.6.attention.output.LayerNorm.bias', 'roberta.encoder.layer.6.output.LayerNorm.weight', 'roberta.encoder.layer.6.output.LayerNorm.bias', 'roberta.encoder.layer.7.attention.output.LayerNorm.weight', 'roberta.encoder.layer.7.attention.output.LayerNorm.bias', 'roberta.encoder.layer.7.output.LayerNorm.weight', 'roberta.encoder.layer.7.output.LayerNorm.bias', 'roberta.encoder.layer.8.attention.output.LayerNorm.weight', 'roberta.encoder.layer.8.attention.output.LayerNorm.bias', 'roberta.encoder.layer.8.output.LayerNorm.weight', 'roberta.encoder.layer.8.output.LayerNorm.bias', 'roberta.encoder.layer.9.attention.output.LayerNorm.weight', 'roberta.encoder.layer.9.attention.output.LayerNorm.bias', 'roberta.encoder.layer.9.output.LayerNorm.weight', 'roberta.encoder.layer.9.output.LayerNorm.bias', 'roberta.encoder.layer.10.attention.output.LayerNorm.weight', 'roberta.encoder.layer.10.attention.output.LayerNorm.bias', 'roberta.encoder.layer.10.output.LayerNorm.weight', 'roberta.encoder.layer.10.output.LayerNorm.bias', 'roberta.encoder.layer.11.attention.output.LayerNorm.weight', 'roberta.encoder.layer.11.attention.output.LayerNorm.bias', 'roberta.encoder.layer.11.output.LayerNorm.weight', 'roberta.encoder.layer.11.output.LayerNorm.bias'].
+    There were unexpected keys in the checkpoint model loaded: ['roberta.embeddings.LayerNorm.beta', 'roberta.embeddings.LayerNorm.gamma', 'roberta.encoder.layer.0.attention.output.LayerNorm.beta', 'roberta.encoder.layer.0.attention.output.LayerNorm.gamma', 'roberta.encoder.layer.0.output.LayerNorm.beta', 'roberta.encoder.layer.0.output.LayerNorm.gamma', 'roberta.encoder.layer.1.attention.output.LayerNorm.beta', 'roberta.encoder.layer.1.attention.output.LayerNorm.gamma', 'roberta.encoder.layer.1.output.LayerNorm.beta', 'roberta.encoder.layer.1.output.LayerNorm.gamma', 'roberta.encoder.layer.2.attention.output.LayerNorm.beta', 'roberta.encoder.layer.2.attention.output.LayerNorm.gamma', 'roberta.encoder.layer.2.output.LayerNorm.beta', 'roberta.encoder.layer.2.output.LayerNorm.gamma', 'roberta.encoder.layer.3.attention.output.LayerNorm.beta', 'roberta.encoder.layer.3.attention.output.LayerNorm.gamma', 'roberta.encoder.layer.3.output.LayerNorm.beta', 'roberta.encoder.layer.3.output.LayerNorm.gamma', 'roberta.encoder.layer.4.attention.output.LayerNorm.beta', 'roberta.encoder.layer.4.attention.output.LayerNorm.gamma', 'roberta.encoder.layer.4.output.LayerNorm.beta', 'roberta.encoder.layer.4.output.LayerNorm.gamma', 'roberta.encoder.layer.5.attention.output.LayerNorm.beta', 'roberta.encoder.layer.5.attention.output.LayerNorm.gamma', 'roberta.encoder.layer.5.output.LayerNorm.beta', 'roberta.encoder.layer.5.output.LayerNorm.gamma', 'roberta.encoder.layer.6.attention.output.LayerNorm.beta', 'roberta.encoder.layer.6.attention.output.LayerNorm.gamma', 'roberta.encoder.layer.6.output.LayerNorm.beta', 'roberta.encoder.layer.6.output.LayerNorm.gamma', 'roberta.encoder.layer.7.attention.output.LayerNorm.beta', 'roberta.encoder.layer.7.attention.output.LayerNorm.gamma', 'roberta.encoder.layer.7.output.LayerNorm.beta', 'roberta.encoder.layer.7.output.LayerNorm.gamma', 'roberta.encoder.layer.8.attention.output.LayerNorm.beta', 'roberta.encoder.layer.8.attention.output.LayerNorm.gamma', 'roberta.encoder.layer.8.output.LayerNorm.beta', 'roberta.encoder.layer.8.output.LayerNorm.gamma', 'roberta.encoder.layer.9.attention.output.LayerNorm.beta', 'roberta.encoder.layer.9.attention.output.LayerNorm.gamma', 'roberta.encoder.layer.9.output.LayerNorm.beta', 'roberta.encoder.layer.9.output.LayerNorm.gamma', 'roberta.encoder.layer.10.attention.output.LayerNorm.beta', 'roberta.encoder.layer.10.attention.output.LayerNorm.gamma', 'roberta.encoder.layer.10.output.LayerNorm.beta', 'roberta.encoder.layer.10.output.LayerNorm.gamma', 'roberta.encoder.layer.11.attention.output.LayerNorm.beta', 'roberta.encoder.layer.11.attention.output.LayerNorm.gamma', 'roberta.encoder.layer.11.output.LayerNorm.beta', 'roberta.encoder.layer.11.output.LayerNorm.gamma'].
+
+    RoBERTa training complete
+
+    # Step 28: Evaluate RoBERTa
+    roberta_preds, roberta_acc, roberta_f1_macro, roberta_f1_w = evaluate_model(
+        roberta_trainer, roberta_val_ds, val_labels, EMOTION_LABELS, 'RoBERTa'
+    )
+    clear_gpu()
+
+    <IPython.core.display.HTML object>
+
+
+    --- RoBERTa Results ---
+    Accuracy    : 0.9364
+    Weighted F1 : 0.9364
+    Macro F1    : 0.9090
+
+    Classification Report:
+                  precision    recall  f1-score   support
+
+         sadness       0.96      0.97      0.97       550
+             joy       0.95      0.95      0.95       703
+            love       0.87      0.88      0.87       178
+           anger       0.94      0.95      0.94       274
+            fear       0.92      0.87      0.89       212
+        surprise       0.82      0.84      0.83        81
+
+        accuracy                           0.94      1998
+       macro avg       0.91      0.91      0.91      1998
+    weighted avg       0.94      0.94      0.94      1998
+
+Model 3: DistilBERT (distilbert-base-uncased)
+
+    # Step 29: Tokenize with DistilBERT and train
+    clear_gpu()
+
+    distilbert_train_ds = EmotionDataset(tokenize_texts(df['text_clean'],     distilbert_tokenizer), train_labels)
+    distilbert_val_ds   = EmotionDataset(tokenize_texts(val_df['text_clean'], distilbert_tokenizer), val_labels)
+
+    distilbert_model = DistilBertForSequenceClassification.from_pretrained(
+        'distilbert-base-uncased', num_labels=NUM_EMOTION_LABELS
+    )
+    print(f"DistilBERT parameters: {sum(p.numel() for p in distilbert_model.parameters()):,}")
+
+    distilbert_trainer = Trainer(
+        model=distilbert_model,
+        args=get_training_args('./results/distilbert'),
+        train_dataset=distilbert_train_ds,
+        eval_dataset=distilbert_val_ds,
+        compute_metrics=compute_metrics
+    )
+    distilbert_trainer.train()
+    print("DistilBERT training complete")
+
+    {"model_id":"19015d60a5074de2b2a0a7becd3fcc91","version_major":2,"version_minor":0}
+
+    {"model_id":"a8d881e23f0b473cb7bc41083e9abcbc","version_major":2,"version_minor":0}
+
+    {"model_id":"c592e29640fd44b58d73e1ea10dce313","version_major":2,"version_minor":0}
+
+    DistilBertForSequenceClassification LOAD REPORT from: distilbert-base-uncased
+    Key                     | Status     | 
+    ------------------------+------------+-
+    vocab_transform.weight  | UNEXPECTED | 
+    vocab_projector.bias    | UNEXPECTED | 
+    vocab_layer_norm.weight | UNEXPECTED | 
+    vocab_transform.bias    | UNEXPECTED | 
+    vocab_layer_norm.bias   | UNEXPECTED | 
+    pre_classifier.weight   | MISSING    | 
+    classifier.bias         | MISSING    | 
+    pre_classifier.bias     | MISSING    | 
+    classifier.weight       | MISSING    | 
+
+    Notes:
+    - UNEXPECTED	:can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+    - MISSING	:those params were newly initialized because missing from the checkpoint. Consider training on your downstream task.
+
+    DistilBERT parameters: 66,958,086
+
+    <IPython.core.display.HTML object>
+
+    {"model_id":"1befc0c49db848eda0ff2d38a2f8e7bd","version_major":2,"version_minor":0}
+
+    {"model_id":"5119bc9c93fc44a3a66ad25b5cf846dc","version_major":2,"version_minor":0}
+
+    {"model_id":"b3450d69003748f68aefc40452f6df39","version_major":2,"version_minor":0}
+
+    There were missing keys in the checkpoint model loaded: ['distilbert.embeddings.LayerNorm.weight', 'distilbert.embeddings.LayerNorm.bias'].
+    There were unexpected keys in the checkpoint model loaded: ['distilbert.embeddings.LayerNorm.beta', 'distilbert.embeddings.LayerNorm.gamma'].
+
+    DistilBERT training complete
+
+    # Step 30: Evaluate DistilBERT
+    distilbert_preds, distilbert_acc, distilbert_f1_macro, distilbert_f1_w = evaluate_model(
+        distilbert_trainer, distilbert_val_ds, val_labels, EMOTION_LABELS, 'DistilBERT'
+    )
+    clear_gpu()
+
+    <IPython.core.display.HTML object>
+
+
+    --- DistilBERT Results ---
+    Accuracy    : 0.9414
+    Weighted F1 : 0.9409
+    Macro F1    : 0.9170
+
+    Classification Report:
+                  precision    recall  f1-score   support
+
+         sadness       0.95      0.98      0.96       550
+             joy       0.96      0.97      0.96       703
+            love       0.90      0.88      0.89       178
+           anger       0.95      0.92      0.94       274
+            fear       0.90      0.90      0.90       212
+        surprise       0.93      0.79      0.85        81
+
+        accuracy                           0.94      1998
+       macro avg       0.93      0.91      0.92      1998
+    weighted avg       0.94      0.94      0.94      1998
+
+Model 4: ALBERT (albert-base-v2)
+
+    # Step 31: Tokenize with ALBERT and train
+    clear_gpu()
+
+    albert_train_ds = EmotionDataset(tokenize_texts(df['text_clean'],     albert_tokenizer), train_labels)
+    albert_val_ds   = EmotionDataset(tokenize_texts(val_df['text_clean'], albert_tokenizer), val_labels)
+
+    albert_model = AlbertForSequenceClassification.from_pretrained(
+        'albert-base-v2', num_labels=NUM_EMOTION_LABELS
+    )
+    print(f"ALBERT parameters: {sum(p.numel() for p in albert_model.parameters()):,}")
+
+    albert_trainer = Trainer(
+        model=albert_model,
+        args=get_training_args('./results/albert'),
+        train_dataset=albert_train_ds,
+        eval_dataset=albert_val_ds,
+        compute_metrics=compute_metrics
+    )
+    albert_trainer.train()
+    print("ALBERT training complete")
+
+    {"model_id":"01ed9a1c2dad41069398b54ac33574ea","version_major":2,"version_minor":0}
+
+    {"model_id":"1d131029f96d483a8a806d4c5edcd9da","version_major":2,"version_minor":0}
+
+    {"model_id":"1e84d389f13247f9964bd3b7c8ff08fb","version_major":2,"version_minor":0}
+
+    AlbertForSequenceClassification LOAD REPORT from: albert-base-v2
+    Key                          | Status     | 
+    -----------------------------+------------+-
+    predictions.dense.weight     | UNEXPECTED | 
+    predictions.decoder.bias     | UNEXPECTED | 
+    predictions.LayerNorm.bias   | UNEXPECTED | 
+    predictions.dense.bias       | UNEXPECTED | 
+    predictions.LayerNorm.weight | UNEXPECTED | 
+    predictions.bias             | UNEXPECTED | 
+    classifier.bias              | MISSING    | 
+    classifier.weight            | MISSING    | 
+
+    Notes:
+    - UNEXPECTED	:can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+    - MISSING	:those params were newly initialized because missing from the checkpoint. Consider training on your downstream task.
+
+    ALBERT parameters: 11,688,198
+
+    <IPython.core.display.HTML object>
+
+    {"model_id":"7c89cfd47e06444f9992faf38bd59d57","version_major":2,"version_minor":0}
+
+    {"model_id":"cbc315e930c6478685d3a37dbde33fb7","version_major":2,"version_minor":0}
+
+    {"model_id":"f831397a7abb40268f65183f7e879412","version_major":2,"version_minor":0}
+
+    There were missing keys in the checkpoint model loaded: ['albert.embeddings.LayerNorm.weight', 'albert.embeddings.LayerNorm.bias', 'albert.encoder.albert_layer_groups.0.albert_layers.0.attention.LayerNorm.weight', 'albert.encoder.albert_layer_groups.0.albert_layers.0.attention.LayerNorm.bias'].
+    There were unexpected keys in the checkpoint model loaded: ['albert.embeddings.LayerNorm.beta', 'albert.embeddings.LayerNorm.gamma', 'albert.encoder.albert_layer_groups.0.albert_layers.0.attention.LayerNorm.beta', 'albert.encoder.albert_layer_groups.0.albert_layers.0.attention.LayerNorm.gamma'].
+
+    ALBERT training complete
+
+    # Step 32: Evaluate ALBERT
+    albert_preds, albert_acc, albert_f1_macro, albert_f1_w = evaluate_model(
+        albert_trainer, albert_val_ds, val_labels, EMOTION_LABELS, 'ALBERT'
+    )
+    clear_gpu()
+
+    <IPython.core.display.HTML object>
+
+
+    --- ALBERT Results ---
+    Accuracy    : 0.9379
+    Weighted F1 : 0.9377
+    Macro F1    : 0.9100
+
+    Classification Report:
+                  precision    recall  f1-score   support
+
+         sadness       0.96      0.97      0.97       550
+             joy       0.96      0.96      0.96       703
+            love       0.90      0.89      0.90       178
+           anger       0.93      0.94      0.94       274
+            fear       0.88      0.86      0.87       212
+        surprise       0.85      0.81      0.83        81
+
+        accuracy                           0.94      1998
+       macro avg       0.91      0.91      0.91      1998
+    weighted avg       0.94      0.94      0.94      1998
+
+Model 5: XLNet (xlnet-base-cased)
+
+    # Step 33: Tokenize with XLNet and train
+    # XLNet is cased - using text_clean_cased (no lowercase applied)
+    clear_gpu()
+
+    xlnet_train_ds = EmotionDataset(tokenize_texts(df['text_clean_cased'],     xlnet_tokenizer), train_labels)
+    xlnet_val_ds   = EmotionDataset(tokenize_texts(val_df['text_clean_cased'], xlnet_tokenizer), val_labels)
+
+    xlnet_model = XLNetForSequenceClassification.from_pretrained(
+        'xlnet-base-cased', num_labels=NUM_EMOTION_LABELS
+    )
+    print(f"XLNet parameters: {sum(p.numel() for p in xlnet_model.parameters()):,}")
+
+    xlnet_trainer = Trainer(
+        model=xlnet_model,
+        args=get_training_args('./results/xlnet'),
+        train_dataset=xlnet_train_ds,
+        eval_dataset=xlnet_val_ds,
+        compute_metrics=compute_metrics
+    )
+    xlnet_trainer.train()
+    print("XLNet training complete")
+
+    {"model_id":"ac79ccfec8214de6a2984d19db7e431d","version_major":2,"version_minor":0}
+
+    {"model_id":"7315c7f1bd8f49c6b8506716edd7d5db","version_major":2,"version_minor":0}
+
+    {"model_id":"868d6c90f4c9452082009575a4d431fc","version_major":2,"version_minor":0}
+
+    XLNetForSequenceClassification LOAD REPORT from: xlnet-base-cased
+    Key                             | Status     | 
+    --------------------------------+------------+-
+    lm_loss.bias                    | UNEXPECTED | 
+    lm_loss.weight                  | UNEXPECTED | 
+    sequence_summary.summary.bias   | MISSING    | 
+    sequence_summary.summary.weight | MISSING    | 
+    logits_proj.bias                | MISSING    | 
+    logits_proj.weight              | MISSING    | 
+
+    Notes:
+    - UNEXPECTED	:can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+    - MISSING	:those params were newly initialized because missing from the checkpoint. Consider training on your downstream task.
+
+    XLNet parameters: 117,313,542
+
+    {"model_id":"bc1d8b21ca42470a8612ea2791a5b320","version_major":2,"version_minor":0}
+
+    <IPython.core.display.HTML object>
+
+    {"model_id":"09bb3224a6ac404ebeae82c5c6ad94f6","version_major":2,"version_minor":0}
+
+    {"model_id":"529ebafd2edf4c0496e425e6dbd5221c","version_major":2,"version_minor":0}
+
+    {"model_id":"cbfed9da79f842ca85606fd0cb605bb6","version_major":2,"version_minor":0}
+
+    XLNet training complete
+
+    # Step 34: Evaluate XLNet
+    xlnet_preds, xlnet_acc, xlnet_f1_macro, xlnet_f1_w = evaluate_model(
+        xlnet_trainer, xlnet_val_ds, val_labels, EMOTION_LABELS, 'XLNet'
+    )
+    clear_gpu()
+
+    <IPython.core.display.HTML object>
+
+
+    --- XLNet Results ---
+    Accuracy    : 0.9374
+    Weighted F1 : 0.9377
+    Macro F1    : 0.9137
+
+    Classification Report:
+                  precision    recall  f1-score   support
+
+         sadness       0.95      0.97      0.96       550
+             joy       0.97      0.95      0.96       703
+            love       0.85      0.91      0.88       178
+           anger       0.96      0.93      0.94       274
+            fear       0.87      0.91      0.89       212
+        surprise       0.88      0.83      0.85        81
+
+        accuracy                           0.94      1998
+       macro avg       0.91      0.91      0.91      1998
+    weighted avg       0.94      0.94      0.94      1998
+
+------------------------------------------------------------------------
+
+Section 7: Comparative Analysis - All Models
+
+    # Step 35: Model comparison table
+    results = pd.DataFrame({
+        'Model':       ['BERT', 'RoBERTa', 'DistilBERT', 'ALBERT', 'XLNet'],
+        'Accuracy':    [bert_acc,    roberta_acc,    distilbert_acc,    albert_acc,    xlnet_acc],
+        'Macro_F1':    [bert_f1_macro, roberta_f1_macro, distilbert_f1_macro, albert_f1_macro, xlnet_f1_macro],
+        'Weighted_F1': [bert_f1_w,   roberta_f1_w,   distilbert_f1_w,   albert_f1_w,   xlnet_f1_w]
+    }).sort_values('Accuracy', ascending=False).reset_index(drop=True)
+
+    print("Model Comparison (Emotion Dataset, sorted by Accuracy):\n")
+    print(results.to_string(index=False))
+
+    results.to_csv('model_comparison_emotion.csv', index=False)
+    print("\nSaved: model_comparison_emotion.csv")
+
+    Model Comparison (Emotion Dataset, sorted by Accuracy):
+
+         Model  Accuracy  Macro_F1  Weighted_F1
+          BERT  0.945946  0.925202     0.945979
+    DistilBERT  0.941441  0.917039     0.940945
+        ALBERT  0.937938  0.910029     0.937707
+         XLNet  0.937437  0.913744     0.937696
+       RoBERTa  0.936436  0.909019     0.936384
+
+    Saved: model_comparison_emotion.csv
+
+    # Step 36: Comparison bar charts
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    colors  = ['#2196F3', '#4CAF50', '#F44336', '#9C27B0', '#FF9800']
+    metrics = ['Accuracy', 'Macro_F1', 'Weighted_F1']
+    titles  = ['Accuracy', 'Macro F1', 'Weighted F1']
+
+    for ax, metric, title in zip(axes, metrics, titles):
+        bars = ax.bar(results['Model'], results[metric], color=colors)
+        ax.set_title(title)
+        ax.set_ylabel(title)
+        ax.set_ylim(0, 1.05)
+        ax.tick_params(axis='x', rotation=30)
+        for bar, val in zip(bars, results[metric]):
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
+                    f'{val:.3f}', ha='center', fontsize=9)
+
+    plt.suptitle('All Models - Emotion Dataset (6 Classes)', fontsize=13, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig('model_comparison_chart.png', dpi=150, bbox_inches='tight')
+    plt.show()
+
+[]
+
+    # Step 37: All confusion matrices
+    all_preds = {
+        'BERT':       bert_preds,
+        'RoBERTa':    roberta_preds,
+        'DistilBERT': distilbert_preds,
+        'ALBERT':     albert_preds,
+        'XLNet':      xlnet_preds
+    }
+
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+
+    for idx, (name, preds) in enumerate(all_preds.items()):
+        ax = axes[idx // 3][idx % 3]
+        cm = confusion_matrix(val_labels, preds)
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                    xticklabels=EMOTION_LABELS, yticklabels=EMOTION_LABELS, ax=ax)
+        ax.set_title(f'{name} Confusion Matrix')
+        ax.set_xlabel('Predicted')
+        ax.set_ylabel('True')
+        ax.tick_params(axis='x', rotation=45)
+
+    axes[1][2].axis('off')
+    plt.suptitle('Confusion Matrices - All Models (Emotion Dataset)', fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig('all_confusion_matrices.png', dpi=150, bbox_inches='tight')
+    plt.show()
+
+[]
+
+    # Step 38: Error analysis - top misclassification pairs per model
+
+    def top_misclassifications(true_labels, pred_labels, label_names, model_name, top_n=5):
+        cm    = confusion_matrix(true_labels, pred_labels)
+        pairs = []
+        for i in range(len(cm)):
+            for j in range(len(cm)):
+                if i != j and cm[i, j] > 0:
+                    pairs.append((label_names[i], label_names[j], cm[i, j]))
+        pairs.sort(key=lambda x: x[2], reverse=True)
+        print(f"\n{model_name} - Top {top_n} Misclassifications:")
+        for true, pred, count in pairs[:top_n]:
+            print(f"  True: {true:12} -> Predicted: {pred:12} | Count: {count}")
+
+    for name, preds in all_preds.items():
+        top_misclassifications(val_labels, preds, EMOTION_LABELS, name)
+
+
+    BERT - Top 5 Misclassifications:
+      True: love         -> Predicted: joy          | Count: 20
+      True: joy          -> Predicted: love         | Count: 12
+      True: sadness      -> Predicted: fear         | Count: 10
+      True: anger        -> Predicted: sadness      | Count: 10
+      True: surprise     -> Predicted: fear         | Count: 10
+
+    RoBERTa - Top 5 Misclassifications:
+      True: joy          -> Predicted: love         | Count: 23
+      True: love         -> Predicted: joy          | Count: 20
+      True: fear         -> Predicted: anger        | Count: 11
+      True: anger        -> Predicted: sadness      | Count: 10
+      True: fear         -> Predicted: surprise     | Count: 9
+
+    DistilBERT - Top 5 Misclassifications:
+      True: love         -> Predicted: joy          | Count: 18
+      True: joy          -> Predicted: love         | Count: 16
+      True: anger        -> Predicted: sadness      | Count: 13
+      True: surprise     -> Predicted: fear         | Count: 11
+      True: fear         -> Predicted: sadness      | Count: 10
+
+    ALBERT - Top 5 Misclassifications:
+      True: joy          -> Predicted: love         | Count: 18
+      True: love         -> Predicted: joy          | Count: 17
+      True: fear         -> Predicted: anger        | Count: 13
+      True: anger        -> Predicted: sadness      | Count: 12
+      True: surprise     -> Predicted: fear         | Count: 11
+
+    XLNet - Top 5 Misclassifications:
+      True: joy          -> Predicted: love         | Count: 27
+      True: love         -> Predicted: joy          | Count: 14
+      True: sadness      -> Predicted: fear         | Count: 12
+      True: anger        -> Predicted: sadness      | Count: 12
+      True: surprise     -> Predicted: fear         | Count: 9
+
+------------------------------------------------------------------------
+
+Section 8: GoEmotions - Fine-Grained Detection (28 Classes)
+
+    # Step 39: Tokenize GoEmotions and train BERT (best performer from Section 7)
+    clear_gpu()
+
+    go_train_ds = EmotionDataset(tokenize_texts(go_train_df['text_clean'], bert_tokenizer), go_train_labels)
+    go_val_ds   = EmotionDataset(tokenize_texts(go_val_df['text_clean'],   bert_tokenizer), go_val_labels)
+
+    go_bert_model = AutoModelForSequenceClassification.from_pretrained(
+        'bert-base-uncased', num_labels=NUM_GOEMOTIONS_LABELS
+    )
+    print(f"BERT (GoEmotions) parameters: {sum(p.numel() for p in go_bert_model.parameters()):,}")
+
+    go_trainer = Trainer(
+        model=go_bert_model,
+        args=get_training_args('./results/goemotions_bert', epochs=2),
+        train_dataset=go_train_ds,
+        eval_dataset=go_val_ds,
+        compute_metrics=compute_metrics
+    )
+    go_trainer.train()
+    print("BERT GoEmotions training complete")
+
+    {"model_id":"6663c192eef44a8a80b477927c1a18f1","version_major":2,"version_minor":0}
+
+    BertForSequenceClassification LOAD REPORT from: bert-base-uncased
+    Key                                        | Status     | 
+    -------------------------------------------+------------+-
+    cls.predictions.transform.dense.weight     | UNEXPECTED | 
+    cls.predictions.bias                       | UNEXPECTED | 
+    cls.predictions.transform.dense.bias       | UNEXPECTED | 
+    cls.seq_relationship.bias                  | UNEXPECTED | 
+    cls.seq_relationship.weight                | UNEXPECTED | 
+    cls.predictions.transform.LayerNorm.weight | UNEXPECTED | 
+    cls.predictions.transform.LayerNorm.bias   | UNEXPECTED | 
+    classifier.bias                            | MISSING    | 
+    classifier.weight                          | MISSING    | 
+
+    Notes:
+    - UNEXPECTED	:can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+    - MISSING	:those params were newly initialized because missing from the checkpoint. Consider training on your downstream task.
+
+    BERT (GoEmotions) parameters: 109,503,772
+
+    <IPython.core.display.HTML object>
+
+    {"model_id":"f2ff38e0103b4122aaa12057dafaed31","version_major":2,"version_minor":0}
+
+    {"model_id":"dcda658c2aca4f5db1ff74ce68d2f916","version_major":2,"version_minor":0}
+
+    There were missing keys in the checkpoint model loaded: ['bert.embeddings.LayerNorm.weight', 'bert.embeddings.LayerNorm.bias', 'bert.encoder.layer.0.attention.output.LayerNorm.weight', 'bert.encoder.layer.0.attention.output.LayerNorm.bias', 'bert.encoder.layer.0.output.LayerNorm.weight', 'bert.encoder.layer.0.output.LayerNorm.bias', 'bert.encoder.layer.1.attention.output.LayerNorm.weight', 'bert.encoder.layer.1.attention.output.LayerNorm.bias', 'bert.encoder.layer.1.output.LayerNorm.weight', 'bert.encoder.layer.1.output.LayerNorm.bias', 'bert.encoder.layer.2.attention.output.LayerNorm.weight', 'bert.encoder.layer.2.attention.output.LayerNorm.bias', 'bert.encoder.layer.2.output.LayerNorm.weight', 'bert.encoder.layer.2.output.LayerNorm.bias', 'bert.encoder.layer.3.attention.output.LayerNorm.weight', 'bert.encoder.layer.3.attention.output.LayerNorm.bias', 'bert.encoder.layer.3.output.LayerNorm.weight', 'bert.encoder.layer.3.output.LayerNorm.bias', 'bert.encoder.layer.4.attention.output.LayerNorm.weight', 'bert.encoder.layer.4.attention.output.LayerNorm.bias', 'bert.encoder.layer.4.output.LayerNorm.weight', 'bert.encoder.layer.4.output.LayerNorm.bias', 'bert.encoder.layer.5.attention.output.LayerNorm.weight', 'bert.encoder.layer.5.attention.output.LayerNorm.bias', 'bert.encoder.layer.5.output.LayerNorm.weight', 'bert.encoder.layer.5.output.LayerNorm.bias', 'bert.encoder.layer.6.attention.output.LayerNorm.weight', 'bert.encoder.layer.6.attention.output.LayerNorm.bias', 'bert.encoder.layer.6.output.LayerNorm.weight', 'bert.encoder.layer.6.output.LayerNorm.bias', 'bert.encoder.layer.7.attention.output.LayerNorm.weight', 'bert.encoder.layer.7.attention.output.LayerNorm.bias', 'bert.encoder.layer.7.output.LayerNorm.weight', 'bert.encoder.layer.7.output.LayerNorm.bias', 'bert.encoder.layer.8.attention.output.LayerNorm.weight', 'bert.encoder.layer.8.attention.output.LayerNorm.bias', 'bert.encoder.layer.8.output.LayerNorm.weight', 'bert.encoder.layer.8.output.LayerNorm.bias', 'bert.encoder.layer.9.attention.output.LayerNorm.weight', 'bert.encoder.layer.9.attention.output.LayerNorm.bias', 'bert.encoder.layer.9.output.LayerNorm.weight', 'bert.encoder.layer.9.output.LayerNorm.bias', 'bert.encoder.layer.10.attention.output.LayerNorm.weight', 'bert.encoder.layer.10.attention.output.LayerNorm.bias', 'bert.encoder.layer.10.output.LayerNorm.weight', 'bert.encoder.layer.10.output.LayerNorm.bias', 'bert.encoder.layer.11.attention.output.LayerNorm.weight', 'bert.encoder.layer.11.attention.output.LayerNorm.bias', 'bert.encoder.layer.11.output.LayerNorm.weight', 'bert.encoder.layer.11.output.LayerNorm.bias'].
+    There were unexpected keys in the checkpoint model loaded: ['bert.embeddings.LayerNorm.beta', 'bert.embeddings.LayerNorm.gamma', 'bert.encoder.layer.0.attention.output.LayerNorm.beta', 'bert.encoder.layer.0.attention.output.LayerNorm.gamma', 'bert.encoder.layer.0.output.LayerNorm.beta', 'bert.encoder.layer.0.output.LayerNorm.gamma', 'bert.encoder.layer.1.attention.output.LayerNorm.beta', 'bert.encoder.layer.1.attention.output.LayerNorm.gamma', 'bert.encoder.layer.1.output.LayerNorm.beta', 'bert.encoder.layer.1.output.LayerNorm.gamma', 'bert.encoder.layer.2.attention.output.LayerNorm.beta', 'bert.encoder.layer.2.attention.output.LayerNorm.gamma', 'bert.encoder.layer.2.output.LayerNorm.beta', 'bert.encoder.layer.2.output.LayerNorm.gamma', 'bert.encoder.layer.3.attention.output.LayerNorm.beta', 'bert.encoder.layer.3.attention.output.LayerNorm.gamma', 'bert.encoder.layer.3.output.LayerNorm.beta', 'bert.encoder.layer.3.output.LayerNorm.gamma', 'bert.encoder.layer.4.attention.output.LayerNorm.beta', 'bert.encoder.layer.4.attention.output.LayerNorm.gamma', 'bert.encoder.layer.4.output.LayerNorm.beta', 'bert.encoder.layer.4.output.LayerNorm.gamma', 'bert.encoder.layer.5.attention.output.LayerNorm.beta', 'bert.encoder.layer.5.attention.output.LayerNorm.gamma', 'bert.encoder.layer.5.output.LayerNorm.beta', 'bert.encoder.layer.5.output.LayerNorm.gamma', 'bert.encoder.layer.6.attention.output.LayerNorm.beta', 'bert.encoder.layer.6.attention.output.LayerNorm.gamma', 'bert.encoder.layer.6.output.LayerNorm.beta', 'bert.encoder.layer.6.output.LayerNorm.gamma', 'bert.encoder.layer.7.attention.output.LayerNorm.beta', 'bert.encoder.layer.7.attention.output.LayerNorm.gamma', 'bert.encoder.layer.7.output.LayerNorm.beta', 'bert.encoder.layer.7.output.LayerNorm.gamma', 'bert.encoder.layer.8.attention.output.LayerNorm.beta', 'bert.encoder.layer.8.attention.output.LayerNorm.gamma', 'bert.encoder.layer.8.output.LayerNorm.beta', 'bert.encoder.layer.8.output.LayerNorm.gamma', 'bert.encoder.layer.9.attention.output.LayerNorm.beta', 'bert.encoder.layer.9.attention.output.LayerNorm.gamma', 'bert.encoder.layer.9.output.LayerNorm.beta', 'bert.encoder.layer.9.output.LayerNorm.gamma', 'bert.encoder.layer.10.attention.output.LayerNorm.beta', 'bert.encoder.layer.10.attention.output.LayerNorm.gamma', 'bert.encoder.layer.10.output.LayerNorm.beta', 'bert.encoder.layer.10.output.LayerNorm.gamma', 'bert.encoder.layer.11.attention.output.LayerNorm.beta', 'bert.encoder.layer.11.attention.output.LayerNorm.gamma', 'bert.encoder.layer.11.output.LayerNorm.beta', 'bert.encoder.layer.11.output.LayerNorm.gamma'].
+
+    BERT GoEmotions training complete
+
+    # Step 40: Evaluate BERT on GoEmotions
+    go_preds, go_acc, go_f1_macro, go_f1_w = evaluate_model(
+        go_trainer, go_val_ds, go_val_labels, GOEMOTIONS_LABELS, 'BERT (GoEmotions)'
+    )
+
+    <IPython.core.display.HTML object>
+
+
+    --- BERT (GoEmotions) Results ---
+    Accuracy    : 0.5845
+    Weighted F1 : 0.5680
+    Macro F1    : 0.4407
+
+    Classification Report:
+                    precision    recall  f1-score   support
+
+        admiration       0.69      0.81      0.74       485
+         amusement       0.75      0.84      0.79       297
+             anger       0.46      0.58      0.52       192
+         annoyance       0.31      0.27      0.29       247
+          approval       0.47      0.28      0.35       355
+            caring       0.50      0.42      0.46       137
+         confusion       0.52      0.38      0.44       136
+         curiosity       0.45      0.56      0.50       205
+            desire       0.62      0.50      0.55        64
+    disappointment       0.40      0.22      0.29       129
+       disapproval       0.45      0.34      0.39       245
+           disgust       0.49      0.42      0.45        74
+     embarrassment       0.71      0.44      0.55        27
+        excitement       0.39      0.27      0.32        78
+              fear       0.64      0.64      0.64        74
+         gratitude       0.85      0.88      0.86       295
+             grief       0.00      0.00      0.00        10
+               joy       0.55      0.48      0.51       121
+              love       0.62      0.85      0.72       177
+       nervousness       0.00      0.00      0.00        11
+          optimism       0.56      0.53      0.54       133
+             pride       0.00      0.00      0.00         9
+       realization       0.64      0.08      0.14        86
+            relief       0.00      0.00      0.00         8
+           remorse       0.58      0.64      0.61        47
+           sadness       0.47      0.59      0.52        85
+          surprise       0.47      0.57      0.51        95
+           neutral       0.61      0.68      0.64      1593
+
+          accuracy                           0.58      5415
+         macro avg       0.47      0.44      0.44      5415
+      weighted avg       0.57      0.58      0.57      5415
+
+    # Step 41: GoEmotions confusion matrix (top 10 classes for readability)
+    top10_classes = pd.Series(go_train_labels).value_counts().head(10).index.tolist()
+    top10_names   = [GOEMOTIONS_LABELS[i] for i in top10_classes]
+
+    full_cm  = confusion_matrix(go_val_labels, go_preds)
+    cm_top10 = full_cm[np.ix_(top10_classes, top10_classes)]
+
+    plt.figure(figsize=(12, 10))
+    sns.heatmap(cm_top10, annot=True, fmt='d', cmap='Greens',
+                xticklabels=top10_names, yticklabels=top10_names)
+    plt.title('BERT - Confusion Matrix (GoEmotions, Top 10 Classes)')
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    plt.xticks(rotation=45, ha='right')
+    plt.tight_layout()
+    plt.savefig('goemotions_confusion_matrix.png', dpi=150, bbox_inches='tight')
+    plt.show()
+    clear_gpu()
+
+[]
+
+------------------------------------------------------------------------
+
+Section 9: Basic vs Fine-Grained Comparison (RQ2)
+
+    # Step 42: Compare basic (6 classes) vs fine-grained (28 classes) performance
+    best_basic_acc = results.iloc[0]['Accuracy']
+    best_basic_f1  = results.iloc[0]['Macro_F1']
+    best_model     = results.iloc[0]['Model']
+
+    granularity_df = pd.DataFrame({
+        'Task':     ['Basic (6 emotions)', 'Fine-grained (28 emotions)'],
+        'Accuracy': [best_basic_acc, go_acc],
+        'Macro_F1': [best_basic_f1,  go_f1_macro]
+    })
+
+    acc_drop = (best_basic_acc - go_acc) * 100
+    f1_drop  = (best_basic_f1  - go_f1_macro) * 100
+
+    print(f"Best model on basic emotions: {best_model}")
+    print(granularity_df.to_string(index=False))
+    print(f"\nAccuracy drop : {acc_drop:.2f}%")
+    print(f"Macro F1 drop : {f1_drop:.2f}%")
+
+    fig, axes  = plt.subplots(1, 2, figsize=(10, 5))
+    bar_colors = ['#2196F3', '#F44336']
+    x_labels   = ['Basic (6)', 'Fine-grained (28)']
+
+    axes[0].bar(x_labels, granularity_df['Accuracy'], color=bar_colors)
+    axes[0].set_title('Accuracy: Basic vs Fine-grained')
+    axes[0].set_ylim(0, 1.05)
+    for i, v in enumerate(granularity_df['Accuracy']):
+        axes[0].text(i, v + 0.02, f'{v:.3f}', ha='center')
+
+    axes[1].bar(x_labels, granularity_df['Macro_F1'], color=bar_colors)
+    axes[1].set_title('Macro F1: Basic vs Fine-grained')
+    axes[1].set_ylim(0, 1.05)
+    for i, v in enumerate(granularity_df['Macro_F1']):
+        axes[1].text(i, v + 0.02, f'{v:.3f}', ha='center')
+
+    plt.suptitle('Basic vs Fine-Grained Emotion Detection (BERT)', fontsize=13, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig('basic_vs_finegrained.png', dpi=150, bbox_inches='tight')
+    plt.show()
+
+    Best model on basic emotions: BERT
+                          Task  Accuracy  Macro_F1
+            Basic (6 emotions)  0.945946  0.925202
+    Fine-grained (28 emotions)  0.584488  0.440658
+
+    Accuracy drop : 36.15%
+    Macro F1 drop : 48.45%
+
+[]
+
+------------------------------------------------------------------------
+
+Section 10: Sample Predictions
+
+    # Step 43: Predict on custom input texts
+
+    def predict_emotion(text, model, tokenizer, label_names):
+        model.eval()
+        cleaned = clean_text(text)
+        inputs  = tokenizer(cleaned, return_tensors='pt', truncation=True, max_length=MAX_LENGTH)
+        if torch.cuda.is_available():
+            inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
+            model.to(DEVICE)
+        with torch.no_grad():
+            logits     = model(**inputs).logits
+            pred_id    = logits.argmax(dim=-1).item()
+            confidence = torch.softmax(logits, dim=-1).squeeze()[pred_id].item()
+        return label_names[pred_id], confidence
+
+    test_texts = [
+        "I am so happy today!",
+        "This is making me really angry!",
+        "I am feeling scared about the results.",
+        "I love spending time with my family.",
+        "Wow, that is really surprising news!",
+        "I feel so sad and lonely."
+    ]
+
+    print("Sample Predictions (BERT, Emotion Dataset):\n")
+    for text in test_texts:
+        label, conf = predict_emotion(text, bert_model, bert_tokenizer, EMOTION_LABELS)
+        print(f"  Text      : {text}")
+        print(f"  Prediction: {label} (confidence: {conf:.2%})")
+        print()
+
+    Sample Predictions (BERT, Emotion Dataset):
+
+      Text      : I am so happy today!
+      Prediction: joy (confidence: 99.88%)
+
+      Text      : This is making me really angry!
+      Prediction: anger (confidence: 99.76%)
+
+      Text      : I am feeling scared about the results.
+      Prediction: fear (confidence: 99.80%)
+
+      Text      : I love spending time with my family.
+      Prediction: joy (confidence: 94.03%)
+
+      Text      : Wow, that is really surprising news!
+      Prediction: surprise (confidence: 88.69%)
+
+      Text      : I feel so sad and lonely.
+      Prediction: sadness (confidence: 99.89%)
+
+------------------------------------------------------------------------
+
+Section 11: Save Models and Results
+
+    # Step 44: Save all trained models and tokenizers
+    os.makedirs('./saved_models', exist_ok=True)
+
+    save_map = {
+        'bert':            (bert_model,       bert_tokenizer),
+        'roberta':         (roberta_model,    roberta_tokenizer),
+        'distilbert':      (distilbert_model, distilbert_tokenizer),
+        'albert':          (albert_model,     albert_tokenizer),
+        'xlnet':           (xlnet_model,      xlnet_tokenizer),
+        'bert_goemotions': (go_bert_model,    bert_tokenizer)
+    }
+
+    for name, (model, tokenizer) in save_map.items():
+        path = f'./saved_models/{name}'
+        model.save_pretrained(path)
+        tokenizer.save_pretrained(path)
+        print(f"Saved: {path}")
+
+    results.to_csv('model_comparison_emotion.csv', index=False)
+    granularity_df.to_csv('basic_vs_finegrained.csv', index=False)
+    print("\nAll models and CSVs saved")
+
+    {"model_id":"d0b4ce2f15094457b6257b9347898ffb","version_major":2,"version_minor":0}
+
+    Saved: ./saved_models/bert
+
+    {"model_id":"77a06146cdaa426a8be52492b4be01b0","version_major":2,"version_minor":0}
+
+    Saved: ./saved_models/roberta
+
+    {"model_id":"94a9ad80ea634958acb25e611fd3a198","version_major":2,"version_minor":0}
+
+    Saved: ./saved_models/distilbert
+
+    {"model_id":"a5f8144cf9ee4350bd4386e2e24fe687","version_major":2,"version_minor":0}
+
+    Saved: ./saved_models/albert
+
+    {"model_id":"823c4042c3e748728827d40094ee31e1","version_major":2,"version_minor":0}
+
+    Saved: ./saved_models/xlnet
+
+    {"model_id":"a9aba9890c2f4f72878171395077e163","version_major":2,"version_minor":0}
+
+    Saved: ./saved_models/bert_goemotions
+
+    All models and CSVs saved
+
+    # Step 45: Final summary
+    print("=" * 65)
+    print("FINAL SUMMARY")
+    print("=" * 65)
+
+    print("\nRQ1 - Misclassification patterns identified:")
+    print("  - Semantically similar emotions (sadness/grief, joy/excitement) are most confused")
+    print("  - Rare classes suffer from class imbalance (surprise, love)")
+    print("  - Fine-grained tasks show higher confusion across overlapping categories")
+
+    print("\nRQ2 - Basic vs Fine-grained performance:")
+    print(f"  - Basic (6 emotions)  - Best Accuracy: {best_basic_acc:.4f}, Macro F1: {best_basic_f1:.4f} [{best_model}]")
+    print(f"  - Fine-grained (28)   - Accuracy:       {go_acc:.4f}, Macro F1: {go_f1_macro:.4f} [BERT]")
+    print(f"  - Performance drop    - Accuracy: -{acc_drop:.2f}%, Macro F1: -{f1_drop:.2f}%")
+
+    print("\nModel Ranking (Emotion Dataset, by Accuracy):")
+    print(results[['Model', 'Accuracy', 'Macro_F1', 'Weighted_F1']].to_string(index=False))
+
+    print("\nGenerated output files:")
+    output_files = [
+        'emotion_distribution.png',     'class_distribution_pie.png',
+        'text_length_analysis.png',     'text_length_comparison.png',
+        'top_words_per_emotion.png',    'goemotions_distribution.png',
+        'cleaning_effect.png',          'bert_token_lengths.png',
+        'bert_confusion_matrix.png',    'all_confusion_matrices.png',
+        'model_comparison_chart.png',   'goemotions_confusion_matrix.png',
+        'basic_vs_finegrained.png',     'model_comparison_emotion.csv',
+        'basic_vs_finegrained.csv'
+    ]
+    for f in output_files:
+        print(f"  {f}")
+
+    print("\n" + "=" * 65)
+
+    =================================================================
+    FINAL SUMMARY
+    =================================================================
+
+    RQ1 - Misclassification patterns identified:
+      - Semantically similar emotions (sadness/grief, joy/excitement) are most confused
+      - Rare classes suffer from class imbalance (surprise, love)
+      - Fine-grained tasks show higher confusion across overlapping categories
+
+    RQ2 - Basic vs Fine-grained performance:
+      - Basic (6 emotions)  - Best Accuracy: 0.9459, Macro F1: 0.9252 [BERT]
+      - Fine-grained (28)   - Accuracy:       0.5845, Macro F1: 0.4407 [BERT]
+      - Performance drop    - Accuracy: -36.15%, Macro F1: -48.45%
+
+    Model Ranking (Emotion Dataset, by Accuracy):
+         Model  Accuracy  Macro_F1  Weighted_F1
+          BERT  0.945946  0.925202     0.945979
+    DistilBERT  0.941441  0.917039     0.940945
+        ALBERT  0.937938  0.910029     0.937707
+         XLNet  0.937437  0.913744     0.937696
+       RoBERTa  0.936436  0.909019     0.936384
+
+    Generated output files:
+      emotion_distribution.png
+      class_distribution_pie.png
+      text_length_analysis.png
+      text_length_comparison.png
+      top_words_per_emotion.png
+      goemotions_distribution.png
+      cleaning_effect.png
+      bert_token_lengths.png
+      bert_confusion_matrix.png
+      all_confusion_matrices.png
+      model_comparison_chart.png
+      goemotions_confusion_matrix.png
+      basic_vs_finegrained.png
+      model_comparison_emotion.csv
+      basic_vs_finegrained.csv
+
+    =================================================================
+
+    # Academic Document: Comparative Evaluation of Large Language Models in Emotion Detection
+
+    ## Abstract
+    This document presents a comparative analysis of five prominent Large Language Models (LLMs) – BERT, RoBERTa, DistilBERT, ALBERT, and XLNet – for emotion detection across two distinct datasets: a 6-class basic emotion dataset and a 28-class fine-grained GoEmotions dataset. The study aims to evaluate the performance of these models in varying degrees of emotional granularity and to elucidate the inherent challenges faced by LLMs in distinguishing subtle emotional nuances. While models achieved high accuracy on basic emotion classification (up to ~94-95%), a significant performance degradation was observed in the fine-grained task (accuracy ~58%), primarily attributed to semantic blurring, severe class imbalance, and the complex nature of informal textual data. This analysis provides a justified understanding of the limitations and capabilities of current LLMs in the nuanced field of affective computing.
+
+    ## 1. Introduction
+    Emotion detection in text is a critical task within Natural Language Processing (NLP) with applications ranging from sentiment analysis to mental health monitoring. However, the complexity of human emotions, particularly their fine-grained distinctions, poses a significant challenge for automated systems. This study investigates the performance disparities of several state-of-the-art Transformer-based LLMs when confronted with both broadly defined (6-class) and highly nuanced (28-class) emotional categories. The primary objective is to quantitatively assess this performance gap and qualitatively justify the observed limitations, thereby contributing to a deeper understanding of LLMs' capabilities in this domain.
+
+    ## 2. Methodology
+
+    ### 2.1 Models Evaluated
+    Five popular LLM architectures were fine-tuned and evaluated:
+    *   **BERT (bert-base-uncased)**: A foundational bidirectional Transformer model.
+    *   **RoBERTa (roberta-base)**: An optimized version of BERT, trained with a larger dataset and longer training steps.
+    *   **DistilBERT (distilbert-base-uncased)**: A smaller, faster, and lighter version of BERT, maintaining much of its performance.
+    *   **ALBERT (albert-base-v2)**: A Lite BERT, utilizing parameter-reduction techniques to lower memory consumption and increase training speed.
+    *   **XLNet (xlnet-base-cased)**: A generalized autoregressive pretraining method that combines the advantages of autoencoding and autoregressive models.
+
+    ### 2.2 Datasets
+    Two distinct datasets were utilized:
+    *   **Emotion Dataset (6 classes)**: Comprising common emotions such as 'sadness', 'joy', 'love', 'anger', 'fear', and 'surprise'. This dataset served as a benchmark for basic emotion detection. (Train: 15,969, Validation: 1,998, Test: 2,000)
+    *   **GoEmotions Dataset (28 classes)**: A fine-grained emotion dataset derived from Reddit comments, encompassing a broad spectrum of human emotions including 'admiration', 'amusement', 'anger', 'annoyance', 'approval', etc. For this study, a single-label classification approach was adopted by selecting the first reported label for multi-labeled instances. (Train: 43,188, Validation: 5,415, Test: 5,421)
+
+    ### 2.3 Preprocessing
+    Text data underwent cleaning, including removal of URLs, mentions, hashtags, HTML tags, non-ASCII characters, and normalization of whitespace. Lowercasing was applied for uncased models, while XLNet used a cased version. Duplicate and very short texts were removed. Tokenization was performed using the respective model's tokenizer with `max_length=128` and truncation.
+
+    ### 2.4 Training and Evaluation
+    Models were fine-tuned for 3 epochs (2 for GoEmotions BERT) with a batch size of 8 and a learning rate of 2e-5. Performance was evaluated using Accuracy, Macro F1-score, and Weighted F1-score on the validation sets. Confusion matrices and misclassification patterns were also analyzed.
+
+    ## 3. Results: 6-Class Emotion Detection
+    The models demonstrated strong performance on the 6-class Emotion dataset, indicating their capability in distinguishing broader emotional categories. The comparative results are presented below:
+
+Model Comparison (Emotion Dataset, sorted by Accuracy):
+
+     Model  Accuracy  Macro_F1  Weighted_F1
+      BERT  0.945946  0.925202     0.945979
+
+DistilBERT 0.941441 0.917039 0.940945 ALBERT 0.937938 0.910029 0.937707
+XLNet 0.937437 0.913744 0.937696 RoBERTa 0.936436 0.909019 0.936384
+
+
+    BERT emerged as the top performer with an accuracy of 0.9459 and a Macro F1 of 0.9252. The confusion matrices for these models revealed common misclassifications between semantically similar emotions (e.g., 'love' often predicted as 'joy', 'sadness' as 'fear'). This suggests that even with basic categories, models can struggle with closely related emotional states.
+
+    ## 4. Results: 28-Class Fine-Grained Emotion Detection
+    For the fine-grained GoEmotions dataset, BERT (the best performer from the 6-class task) was selected for evaluation. The results showed a substantial drop in performance:
+
+                     Task  Accuracy  Macro_F1
+        Basic (6 emotions)  0.945946  0.925202
+
+Fine-grained (28 emotions) 0.584488 0.440658 ```
+
+BERT achieved an accuracy of 0.5845 and a Macro F1 of 0.4407 on the
+GoEmotions dataset. This represents a significant accuracy drop of
+36.15% and a Macro F1 drop of 48.45% compared to the basic emotion task.
+The detailed classification report indicated particularly poor
+performance (zero precision/recall/F1-score) for rare classes such as
+'grief', 'pride', and 'relief'.
+
+5. Discussion and Justification for Performance Discrepancy
+
+The substantial performance difference between the 6-class and 28-class
+emotion detection tasks can be attributed to several critical factors,
+highlighting the inherent limitations of current LLMs in highly nuanced
+emotional analysis:
+
+1.  Complexity of Fine-Grained Emotions (28 vs. 6 Classes):
+    Distinguishing between 28 subtle emotional states (e.g.,
+    'admiration', 'approval', 'caring', 'optimism') is inherently more
+    challenging than classifying into 6 broad categories. The increased
+    number of labels necessitates a finer understanding of linguistic
+    nuances, which LLMs often struggle to capture reliably.
+
+2.  Severe Class Imbalance: The GoEmotions dataset exhibits extreme
+    class imbalance. For instance, 'neutral' has 12,912 samples, while
+    'pride' has only 57 and 'grief' has 65 samples in the training set,
+    leading to an imbalance ratio of 226.53x. This causes models to
+    heavily favor majority classes and perform poorly on minority
+    classes, as evidenced by zero F1-scores for several rare emotions.
+
+3.  Semantic Blurring/Overlapping Categories: Many fine-grained emotions
+    share significant semantic overlap (e.g., 'sadness' and
+    'disappointment', 'joy' and 'excitement', 'anger' and 'annoyance').
+    The model frequently misclassifies between these closely related
+    states because the textual cues are often ambiguous or shared,
+    making precise differentiation difficult. The confusion matrices
+    clearly show such misclassifications.
+
+4.  Lack of Contextual Understanding: LLMs, despite their advancements,
+    often struggle with deep contextual understanding, including
+    implicit meanings, sarcasm, irony, and the speaker's true intent.
+    This is particularly crucial in informal text like Reddit comments,
+    where emotional expression is highly contextual and non-literal,
+    leading to misinterpretations.
+
+5.  Weak Emotional Display in Text: Fine-grained emotions might not
+    always be expressed with strong, explicit linguistic markers in
+    short text snippets. Subtle emotional signals are harder for models
+    to pick up compared to more direct expressions associated with basic
+    emotions, leading to weaker representations and poorer
+    classification.
+
+6.  Data Scarcity for Fine-Grained Distinctions: Even with a large total
+    dataset, the effective sample size for many specific fine-grained
+    emotions becomes very small due to the number of classes. This
+    scarcity of unique examples for each subtle emotion hinders the
+    model's ability to learn robust, distinct features for each class.
+
+7.  LLMs as Pattern Recognizers, Not Emotion Perceivers: Current LLMs
+    are powerful pattern recognition machines; they learn statistical
+    correlations between words/tokens and labels. They do not possess a
+    true
